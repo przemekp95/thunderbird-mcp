@@ -4675,7 +4675,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     },
                     onGetDraftFolderURI() {},
-                    onSendNotPerformed(msgID, status) {
+                    onSendNotPerformed(_msgID, _status) {
                       timer.cancel();
                       settle({ error: "Send was not performed" });
                     },
@@ -4752,7 +4752,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         timer.cancel();
                         settle({ error: e.toString() });
                       }
-                    );
+                    ).catch(e => {
+                      timer.cancel();
+                      settle({ error: e.toString() });
+                    });
                   }
                 } catch (e) {
                   timer.cancel();
@@ -5651,7 +5654,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function deleteContact(contactId) {
+            function _deleteContact(contactId) {
               try {
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
@@ -5671,7 +5674,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function listCalendars() {
+            function _listCalendars() {
               if (!cal) {
                 return { error: "Calendar not available" };
               }
@@ -5689,7 +5692,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
+            async function _createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -5931,7 +5934,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
             }
 
-            async function updateTask(taskId, calendarId, title, dueDate, description, completed, percentComplete, priority) {
+            async function _updateTask(taskId, calendarId, title, dueDate, description, completed, percentComplete, priority) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!taskId) return { error: "taskId is required" };
@@ -6048,7 +6051,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function listEvents(calendarId, startDate, endDate, maxResults) {
+            async function _listEvents(calendarId, startDate, endDate, maxResults) {
               if (!cal) {
                 return { error: "Calendar not available" };
               }
@@ -6142,7 +6145,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function listCategories() {
+            function _listCategories() {
               try {
                 return cal.category.fromPrefs().sort((a, b) => a.localeCompare(b));
               } catch (e) {
@@ -6150,7 +6153,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function listTasks(calendarId, completed, dueBefore, maxResults) {
+            async function _listTasks(calendarId, completed, dueBefore, maxResults) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 const calendars = cal.manager.getCalendars();
@@ -6233,7 +6236,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting) {
+            async function _updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -6354,7 +6357,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function deleteEvent(eventId, calendarId) {
+            async function _deleteEvent(eventId, calendarId) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -6420,7 +6423,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return `<html><body><div>${processed.replace(/\n/g, "<br>")}</div></body></html>`;
             }
 
-            async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
+            async function _createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
               if (!cal || !CalTodo) return { error: "Calendar module not available" };
               if (skipReview && isSkipReviewBlocked()) {
                 return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
@@ -7669,18 +7672,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                                         const saveOne = ({ info, url, size }, index) =>
-                                          new Promise((done) => {
+                                          new Promise((resolve) => {
                         try {
                           if (!url) {
                             info.error = "Missing attachment URL";
-                            done();
+                            resolve();
                             return;
                           }
 
                           const knownSize = typeof size === "number" ? size : null;
                           if (knownSize !== null && knownSize > MAX_ATTACHMENT_BYTES) {
                             info.error = `Attachment too large (${knownSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
-                            done();
+                            resolve();
                             return;
                           }
 
@@ -7696,7 +7699,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
                           } catch (e) {
                             info.error = `Failed to create file: ${e}`;
-                            done();
+                            resolve();
                             return;
                           }
 
@@ -7711,13 +7714,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 try { inputStream?.close(); } catch {}
                                 info.error = `Fetch failed: ${status}`;
                                 try { file.remove(false); } catch {}
-                                done();
+                                resolve();
                                 return;
                               }
                               if (!inputStream) {
                                 info.error = "Fetch returned no data";
                                 try { file.remove(false); } catch {}
-                                done();
+                                resolve();
                                 return;
                               }
 
@@ -7727,7 +7730,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                   try { inputStream.close(); } catch {}
                                   info.error = `Attachment too large (${reqLen} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
                                   try { file.remove(false); } catch {}
-                                  done();
+                                  resolve();
                                   return;
                                 }
                               } catch {
@@ -7743,7 +7746,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                   if (copyStatus && copyStatus !== 0) {
                                     info.error = `Write failed: ${copyStatus}`;
                                     try { file.remove(false); } catch {}
-                                    done();
+                                    resolve();
                                     return;
                                   }
 
@@ -7753,7 +7756,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                     if (actualSize > MAX_ATTACHMENT_BYTES) {
                                       info.error = `Attachment too large (${actualSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
                                       try { file.remove(false); } catch {}
-                                      done();
+                                      resolve();
                                       return;
                                     }
                                   } catch {
@@ -7766,7 +7769,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       info.error = recovered.error;
                                       delete info.filePath;
                                       try { file.remove(false); } catch {}
-                                      done();
+                                      resolve();
                                       return;
                                     }
                                     actualSize = recovered.size;
@@ -7774,22 +7777,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                                   info.filePath = file.path;
                                   _tempAttachFiles.add(file.path);
-                                  done();
+                                  resolve();
                                                                 } catch (e) {
                                   info.error = `Write failed: ${e}`;
                                   try { file.remove(false); } catch {}
-                                  done();
+                                  resolve();
                                 }
                               });
                             } catch (e) {
                               info.error = `Fetch failed: ${e}`;
                               try { file.remove(false); } catch {}
-                              done();
+                              resolve();
                             }
                           });
                         } catch (e) {
                           info.error = String(e);
-                          done();
+                          resolve();
                         }
                       });
 
@@ -8335,6 +8338,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                            result.message = msg;
 	                          }
 	                          resolve(result);
+	                        }).catch(e => {
+	                          resolve({ error: e.toString() });
 	                        });
 	                      } catch (e) {
 	                        resolve({ error: e.toString() });
@@ -8361,6 +8366,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                      result.message = msg;
 	                    }
 	                    resolve(result);
+	                  }).catch(e => {
+	                    resolve({ error: e.toString() });
 	                  });
 
 	                } catch (e) {
@@ -8507,6 +8514,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             result.message = msg;
                           }
                           resolve(result);
+                        }).catch(e => {
+                          resolve({ error: e.toString() });
                         });
                       } catch (e) {
                         resolve({ error: e.toString() });
@@ -8538,6 +8547,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       result.message = msg;
                     }
                     resolve(result);
+                  }).catch(e => {
+                    resolve({ error: e.toString() });
                   });
                 } catch (e) {
                   resolve({ error: e.toString() });
@@ -9304,7 +9315,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return count;
             }
 
-            function emptyTrash(accountId) {
+            function _emptyTrash(accountId) {
               try {
                 const accounts = accountId
                   ? [MailServices.accounts.getAccount(accountId)].filter(Boolean)
@@ -9354,7 +9365,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function emptyJunk(accountId) {
+            function _emptyJunk(accountId) {
               try {
                 const JUNK_FLAG = 0x40000000;
                 const accounts = accountId
@@ -10466,7 +10477,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // ── Filter tool handlers ──
 
-            function listFilters(accountId) {
+            function _listFilters(accountId) {
               try {
                 const results = [];
                 let accounts;
@@ -10517,7 +10528,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function createFilter(accountId, name, enabled, type, conditions, actions, insertAtIndex) {
+            function _createFilter(accountId, name, enabled, type, conditions, actions, insertAtIndex) {
               try {
                 // Coerce arrays from MCP client string serialization
                 if (typeof conditions === "string") {
@@ -10565,7 +10576,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function updateFilter(accountId, filterIndex, name, enabled, type, conditions, actions) {
+            function _updateFilter(accountId, filterIndex, name, enabled, type, conditions, actions) {
               try {
                 // Coerce from MCP client
                 if (typeof filterIndex === "string") filterIndex = parseInt(filterIndex);
@@ -10687,7 +10698,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function deleteFilter(accountId, filterIndex) {
+            function _deleteFilter(accountId, filterIndex) {
               try {
                 if (typeof filterIndex === "string") filterIndex = parseInt(filterIndex);
                 if (!Number.isInteger(filterIndex)) return { error: "filterIndex must be an integer" };
@@ -10711,7 +10722,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function reorderFilters(accountId, fromIndex, toIndex) {
+            function _reorderFilters(accountId, fromIndex, toIndex) {
               try {
                 if (typeof fromIndex === "string") fromIndex = parseInt(fromIndex);
                 if (typeof toIndex === "string") toIndex = parseInt(toIndex);
@@ -10743,7 +10754,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function applyFilters(accountId, folderPath) {
+            function _applyFilters(accountId, folderPath) {
               try {
                 const fl = getFilterListForAccount(accountId);
                 if (fl.error) return fl;
@@ -11800,3 +11811,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     Services.obs.notifyObservers(null, "startupcache-invalidate");
   }
 };
+
+// Thunderbird resolves this Experiment API class by the manifest namespace.
+// Keep an explicit reference so static analysis recognizes the loader export.
+void mcpServer;
