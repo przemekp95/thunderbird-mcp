@@ -1,8 +1,9 @@
 {
-  "name": "thunderbird-mcp",
-  "version": "0.7.4",
-  "description": "MCP server for Thunderbird - enables AI assistants to access email, contacts, and calendars",
-  "author": "Tomasz Kasperczyk",
+  "name": "thunderbird-mcp-safe",
+  "version": "0.4.4",
+  "private": true,
+  "description": "Hardened local MCP bridge for selected Thunderbird mail accounts and address books",
+  "author": "Tomasz Kasperczyk; local hardening fork",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,7 +17,7 @@
     "claude"
   ],
   "bin": {
-    "thunderbird-mcp": "./mcp-bridge.cjs"
+    "thunderbird-mcp-safe": "./mcp-bridge.cjs"
   },
   "files": [
     "mcp-bridge.cjs",

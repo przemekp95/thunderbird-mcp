@@ -195,7 +195,7 @@ describe('protocolVersion negotiation', () => {
 
   it('includes serverInfo with name and version', async () => {
     const response = await sendInitialize('2024-11-05');
-    assert.equal(response.result.serverInfo.name, 'thunderbird-mcp');
+    assert.equal(response.result.serverInfo.name, 'thunderbird-mcp-safe');
     assert.ok(response.result.serverInfo.version, 'serverInfo.version should be non-empty');
   });
 

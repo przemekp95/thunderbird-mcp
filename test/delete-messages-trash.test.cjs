@@ -133,7 +133,7 @@ function toPlainObject(value) {
 }
 
 describe("deleteMessages trash lookup", () => {
-  it("fails without deleting when a non-Drafts folder has no reachable Trash", () => {
+  it("requires explicit confirmation before looking up or moving messages", () => {
     const harness = makeHarness();
 
     const result = harness.deleteMessages(
@@ -141,108 +141,98 @@ describe("deleteMessages trash lookup", () => {
       "imap://account/INBOX"
     );
 
-    assert.deepStrictEqual(toPlainObject(result), { error: "Trash folder not found" });
-    assert.deepStrictEqual(harness.queryInterfaceCalls, [Ci.nsIImapIncomingServer]);
+    assert.deepStrictEqual(toPlainObject(result), {
+      error: "confirmTrash must be true to move messages to Trash",
+    });
+    assert.equal(harness.trashLookups.length, 0);
+    assert.equal(harness.deleteCalls.length, 0);
+    assert.equal(harness.copyCalls.length, 0);
+  });
+
+  it("fails closed when the source folder has no reachable Trash", () => {
+    const harness = makeHarness();
+
+    const result = harness.deleteMessages(
+      [harness.header.messageId],
+      "imap://account/INBOX",
+      true
+    );
+
+    assert.deepStrictEqual(toPlainObject(result), {
+      error: "Trash folder not found; no messages were deleted",
+    });
     assert.equal(harness.trashLookups.length, 1);
     assert.equal(harness.trashLookups[0], harness.folder);
     assert.equal(harness.deleteCalls.length, 0);
     assert.equal(harness.copyCalls.length, 0);
   });
 
-  it("keeps the regular move-style delete when Trash is reachable", () => {
+  it("moves matching messages to Trash without permanent deletion", () => {
     const trashFolder = { URI: "imap://account/Trash" };
     const harness = makeHarness({ trashFolder });
 
     const result = harness.deleteMessages(
       [harness.header.messageId],
-      "imap://account/INBOX"
-    );
-
-    assert.deepStrictEqual(toPlainObject(result), { success: true, deleted: 1 });
-    assert.deepStrictEqual(harness.queryInterfaceCalls, [Ci.nsIImapIncomingServer]);
-    assert.equal(harness.trashLookups.length, 1);
-    assert.equal(harness.deleteCalls.length, 1);
-    assert.equal(harness.deleteCalls[0][0][0], harness.header);
-    assert.deepStrictEqual(harness.deleteCalls[0].slice(1), [null, false, true, null, false]);
-    assert.equal(harness.copyCalls.length, 0);
-  });
-
-  for (const [location, options, folderPath] of [
-    ["Trash", { isTrash: true }, "imap://account/Trash"],
-    ["a Trash descendant", { isTrashDescendant: true }, "imap://account/Trash/Nested"],
-  ]) {
-    it(`allows permanent deletion from ${location} without another Trash folder`, () => {
-      const harness = makeHarness(options);
-
-      const result = harness.deleteMessages(
-        [harness.header.messageId],
-        folderPath
-      );
-
-      assert.deepStrictEqual(toPlainObject(result), { success: true, deleted: 1 });
-      assert.deepStrictEqual(harness.specialFolderChecks, [[Ci.nsMsgFolderFlags.Trash, true]]);
-      assert.equal(harness.queryInterfaceCalls.length, 0);
-      assert.equal(harness.trashLookups.length, 0);
-      assert.equal(harness.deleteCalls.length, 1);
-      assert.deepStrictEqual(harness.deleteCalls[0].slice(1), [null, false, true, null, false]);
-      assert.equal(harness.copyCalls.length, 0);
-    });
-  }
-
-  for (const [modelName, deleteModel] of [
-    ["IMAPDelete", Ci.nsMsgImapDeleteModels.IMAPDelete],
-    ["DeleteNoTrash", Ci.nsMsgImapDeleteModels.DeleteNoTrash],
-  ]) {
-    it(`allows the IMAP ${modelName} model to delete without Trash`, () => {
-      const harness = makeHarness({ deleteModel });
-
-      const result = harness.deleteMessages(
-        [harness.header.messageId],
-        "imap://account/INBOX"
-      );
-
-      assert.deepStrictEqual(toPlainObject(result), { success: true, deleted: 1 });
-      assert.deepStrictEqual(harness.queryInterfaceCalls, [Ci.nsIImapIncomingServer]);
-      assert.equal(harness.trashLookups.length, 0);
-      assert.equal(harness.deleteCalls.length, 1);
-      assert.deepStrictEqual(harness.deleteCalls[0].slice(1), [null, false, true, null, false]);
-      assert.equal(harness.copyCalls.length, 0);
-    });
-  }
-
-  it("keeps the Drafts fallback delete when Trash is unavailable", () => {
-    const harness = makeHarness({ isDrafts: true });
-
-    const result = harness.deleteMessages(
-      [harness.header.messageId],
-      "imap://account/Drafts"
-    );
-
-    assert.deepStrictEqual(toPlainObject(result), { success: true, deleted: 1 });
-    assert.equal(harness.trashLookups.length, 1);
-    assert.equal(harness.deleteCalls.length, 1);
-    assert.equal(harness.copyCalls.length, 0);
-  });
-
-  it("keeps the explicit Drafts move when Trash is reachable", () => {
-    const trashFolder = { URI: "imap://account/Trash" };
-    const harness = makeHarness({ isDrafts: true, trashFolder });
-
-    const result = harness.deleteMessages(
-      [harness.header.messageId],
-      "imap://account/Drafts"
+      "imap://account/INBOX",
+      true
     );
 
     assert.deepStrictEqual(toPlainObject(result), {
       success: true,
-      deleted: 1,
-      movedToTrash: true,
+      movedToTrash: 1,
+      permanentDeletion: false,
     });
+    assert.equal(harness.trashLookups.length, 1);
     assert.equal(harness.deleteCalls.length, 0);
     assert.equal(harness.copyCalls.length, 1);
     assert.equal(harness.copyCalls[0][0], harness.folder);
     assert.equal(harness.copyCalls[0][1][0], harness.header);
     assert.equal(harness.copyCalls[0][2], trashFolder);
     assert.deepStrictEqual(harness.copyCalls[0].slice(3), [true, null, null, false]);
+  });
+
+  for (const [location, options, folderPath] of [
+    ["Trash", { isTrash: true }, "imap://account/Trash"],
+    ["a Trash descendant", { isTrashDescendant: true }, "imap://account/Trash/Nested"],
+  ]) {
+    it(`refuses permanent deletion from ${location}`, () => {
+      const harness = makeHarness(options);
+
+      const result = harness.deleteMessages(
+        [harness.header.messageId],
+        folderPath,
+        true
+      );
+
+      assert.deepStrictEqual(toPlainObject(result), {
+        error: "Refusing to permanently delete messages from Trash",
+      });
+      assert.deepStrictEqual(
+        harness.specialFolderChecks,
+        [[Ci.nsMsgFolderFlags.Trash, true]]
+      );
+      assert.equal(harness.trashLookups.length, 0);
+      assert.equal(harness.deleteCalls.length, 0);
+      assert.equal(harness.copyCalls.length, 0);
+    });
+  }
+
+  it("reports requested messages that were not found while moving the rest", () => {
+    const trashFolder = { URI: "imap://account/Trash" };
+    const harness = makeHarness({ trashFolder });
+
+    const result = harness.deleteMessages(
+      [harness.header.messageId, "missing@example.invalid"],
+      "imap://account/INBOX",
+      true
+    );
+
+    assert.deepStrictEqual(toPlainObject(result), {
+      success: true,
+      movedToTrash: 1,
+      permanentDeletion: false,
+      notFound: ["missing@example.invalid"],
+    });
+    assert.equal(harness.copyCalls.length, 1);
   });
 });

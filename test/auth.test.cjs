@@ -12,7 +12,7 @@
  * - Bridge retry behavior
  */
 
-const { describe, it, before, after, beforeEach, afterEach } = require('node:test');
+const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
 const fs = require('fs');
@@ -22,9 +22,15 @@ const net = require('net');
 const { spawn } = require('child_process');
 
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
-const CONN_DIR = path.join(os.tmpdir(), 'thunderbird-mcp');
+const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'thunderbird-mcp-safe-test-'));
+const TEST_PROFILE_ID = '1'.repeat(32);
+const CONN_DIR = path.join(TEST_ROOT, TEST_PROFILE_ID);
 const CONN_FILE = path.join(CONN_DIR, 'connection.json');
 const DEFAULT_PORT = 8765;
+
+after(() => {
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+});
 
 /**
  * Check if a port is already in use (e.g. real Thunderbird running).
@@ -45,6 +51,10 @@ function sendToBridge(message, { timeout = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        THUNDERBIRD_MCP_CONNECTION_FILE: CONN_FILE,
+      },
     });
 
     let stdout = '';
@@ -91,7 +101,16 @@ function sendToBridge(message, { timeout = 10000 } = {}) {
  */
 function writeTestConnectionInfo(port, token) {
   fs.mkdirSync(CONN_DIR, { recursive: true });
-  fs.writeFileSync(CONN_FILE, JSON.stringify({ port, token, pid: process.pid }), 'utf8');
+  fs.writeFileSync(
+    CONN_FILE,
+    JSON.stringify({
+      port,
+      token,
+      pid: process.pid,
+      profileId: TEST_PROFILE_ID,
+    }),
+    'utf8'
+  );
 }
 
 /**
@@ -503,7 +522,8 @@ describe('Auth: connection file corruption', () => {
     try {
       fs.mkdirSync(CONN_DIR, { recursive: true });
       fs.writeFileSync(CONN_FILE, JSON.stringify({
-        port: TEST_PORT, token: TEST_TOKEN, pid: 12345,
+        port: TEST_PORT, token: TEST_TOKEN, pid: process.pid,
+        profileId: TEST_PROFILE_ID,
         version: '2.0', extraField: 'should be ignored'
       }), 'utf8');
 
@@ -599,7 +619,7 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
 
     assert.equal(response.id, 40);
     assert.ok(response.result);
-    assert.equal(response.result.serverInfo.name, 'thunderbird-mcp');
+    assert.equal(response.result.serverInfo.name, 'thunderbird-mcp-safe');
   });
 
   it('ping succeeds without connection file', async (t) => {
@@ -649,6 +669,10 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
     // Notifications have no id — bridge should not respond
     const child = spawn(process.execPath, [BRIDGE_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        THUNDERBIRD_MCP_CONNECTION_FILE: CONN_FILE,
+      },
     });
 
     let stdout = '';

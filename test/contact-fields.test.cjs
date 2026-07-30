@@ -580,7 +580,10 @@ describe("contact tool wiring", () => {
   });
 
   it("dispatches getContact through the existing UID lookup and shared formatter", () => {
-    assert.match(apiSource, /case "getContact":\s*return getContact\(args\.contactId\);/);
+    assert.match(
+      apiSource,
+      /case "getContact":\s*return hardenContactResult\(getContact\(args\.contactId\)\);/
+    );
     const start = apiSource.indexOf("function getContact(contactId)");
     const end = apiSource.indexOf("function createContact(", start);
     const handler = apiSource.slice(start, end);

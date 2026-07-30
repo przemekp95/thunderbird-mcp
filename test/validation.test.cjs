@@ -41,6 +41,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
   vm.runInContext([
     getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND POLICY', '// END DIRECT SEND POLICY'),
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
@@ -81,6 +82,14 @@ function validateProductionToolArgs(name, args) {
         errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
       }
     }
+  }
+  if (schema.anyOf || schema.oneOf) {
+    productionAttachmentValidation.validateAgainstSchema(
+      args,
+      { anyOf: schema.anyOf, oneOf: schema.oneOf },
+      'arguments',
+      errors
+    );
   }
   return errors;
 }
@@ -183,6 +192,9 @@ function validateAgainstSchema(value, schema, path, errors) {
   if (expectedType === "string") {
     if (schema.minLength !== undefined && value.length < schema.minLength) {
       errors.push(`Parameter '${path}' must contain at least ${schema.minLength} character(s)`);
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+      errors.push(`Parameter '${path}' must contain at most ${schema.maxLength} character(s)`);
     }
     if (schema.contentEncoding === "base64" && !productionAttachmentValidation.isValidBase64(value)) {
       errors.push(`Parameter '${path}' must contain valid base64 data`);
@@ -515,6 +527,30 @@ describe('Validation: pagination parameters', () => {
 });
 
 describe('Validation: folder management', () => {
+  it('createFolder accepts an account id for a top-level folder', () => {
+    const errors = validateProductionToolArgs('createFolder', {
+      accountId: 'account2',
+      name: 'MCP Folder',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('createFolder accepts a verified parent path for a nested folder', () => {
+    const errors = validateProductionToolArgs('createFolder', {
+      parentFolderPath: 'imap://user@server/Archive',
+      name: 'MCP Folder',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('createFolder requires either accountId or parentFolderPath', () => {
+    const errors = validateProductionToolArgs('createFolder', {
+      name: 'MCP Folder',
+    });
+    assert.ok(errors.length > 0);
+    assert.ok(errors.some(error => /schema alternative|required/.test(error)));
+  });
+
   it('renameFolder requires both params', () => {
     const errors = validate('renameFolder', {});
     assert.equal(errors.length, 2);
@@ -948,7 +984,9 @@ describe('Production contact schemas and dispatch', () => {
 
   it('passes contact arguments to handlers in production schema order', () => {
     for (const name of ['getContact', 'createContact', 'updateContact']) {
-      const match = new RegExp(`case "${name}":\\s*return ${name}\\(([^)]*)\\);`)
+      const match = new RegExp(
+        `case "${name}":\\s*return hardenContactResult\\(${name}\\(([^)]*)\\)\\);`
+      )
         .exec(productionContacts.source);
       assert.ok(match, `${name} dispatch missing`);
       const actualArgs = match[1].split(',').map(value => value.trim());
@@ -1269,6 +1307,52 @@ describe('Validator: oneOf items (attachments)', () => {
     });
     assert.ok(errors.some(e => /attachments\[1\]/.test(e)),
       `expected attachments[1] path, got: ${JSON.stringify(errors)}`);
+  });
+});
+
+describe('Validator: sendMailDirect bounds', () => {
+  const base = {
+    to: 'recipient@example.com',
+    subject: 'subject',
+    body: 'body',
+    from: 'sender@example.com',
+  };
+
+  it('accepts the bounded direct-send shape', () => {
+    assert.deepEqual(validateProductionToolArgs('sendMailDirect', base), []);
+  });
+
+  it('rejects skipReview and host-path attachments', () => {
+    assert.ok(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        skipReview: true,
+      }).some(error => /Unknown parameter: skipReview/.test(error))
+    );
+    assert.ok(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        attachments: ['/tmp/file.txt'],
+      }).some(error => /attachments\[0\].*object/.test(error))
+    );
+  });
+
+  it('rejects oversized subject and too many attachments', () => {
+    assert.ok(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        subject: 'x'.repeat(999),
+      }).some(error => /at most 998/.test(error))
+    );
+    assert.ok(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        attachments: Array.from(
+          { length: 4 },
+          (_, index) => ({ name: `${index}.txt`, base64: 'eA==' })
+        ),
+      }).some(error => /at most 3 item/.test(error))
+    );
   });
 });
 

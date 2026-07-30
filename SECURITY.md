@@ -1,75 +1,177 @@
-# Security Policy
+# Security model
 
-## Supported Versions
+## Cel
 
-We support the latest released version of `thunderbird-mcp`. Older
-versions receive no fixes; the recommended path for any security
-finding is to upgrade to the current release.
+Umożliwić lokalnemu klientowi MCP kontrolowaną pracę z pocztą i kontaktami
+z jawnie wskazanych kont i książek adresowych. Automatyczna wysyłka jest
+osobną, domyślnie wyłączoną zdolnością z dodatkowymi allowlistami, limitami i
+audytem; permanentne kasowanie i odczyt dowolnych plików systemowych pozostają
+niedostępne.
 
-| Version  | Supported          |
-| -------- | ------------------ |
-| latest   | ✅                 |
-| < latest | ❌                 |
+## Aktywa
 
-## Reporting a Vulnerability
+- treść i metadane wiadomości;
+- tożsamości kont pocztowych;
+- kontakty i książki adresowe;
+- szkice oraz organizacja folderów;
+- token lokalnego serwera MCP;
+- profil Thunderbirda;
+- pliki użytkownika poza profilem pocztowym.
+- prywatny dziennik zaakceptowanych prób automatycznej wysyłki.
+- trwałe definicje filtrów, ich kopie bezpieczeństwa i dziennik mutacji.
 
-**Please do not file a public GitHub issue for security findings.**
+## Granice zaufania
 
-Use GitHub's [private vulnerability reporting](https://github.com/TKasperczyk/thunderbird-mcp/security/advisories/new)
-on this repository. That route:
+```text
+klient/model MCP
+        |
+        | stdio JSON-RPC
+        v
+lokalny mostek Node.js
+        |
+        | HTTP POST + rotowany Bearer token, 127.0.0.1
+        v
+uprzywilejowany dodatek Thunderbirda
+        |
+        v
+jawnie dozwolone konta pocztowe i książki adresowe
+```
 
-- keeps the report private until a fix is available,
-- generates a CVE if appropriate,
-- coordinates disclosure with downstream Thunderbird users.
+Treść każdej wiadomości znajduje się po niezaufanej stronie granicy. Nie jest
+traktowana jako instrukcja ani konfiguracja.
 
-Acknowledgement target: 72 hours. Triage and a first response on
-severity + likely fix path: 7 days. Substantive fixes for confirmed
-vulnerabilities ship as a patch release.
+## Wymuszenia
 
-## What's in scope
+1. Manifest żąda wyłącznie `accountsRead`, `messagesRead`, `accountsFolders`,
+   `messagesMove`, `addressBooks` i `compose`.
+2. Stała biała lista narzędzi jest sprawdzana przy `tools/list`, przed
+   walidacją wywołania oraz ponownie w dispatcherze.
+3. Brak lub uszkodzenie preferencji kont blokuje wszystkie konta. Osobna,
+   domyślnie pusta lista robi to samo dla książek adresowych.
+4. `getMessage` pozwala na ograniczony tekst, Markdown, HTML, raw RFC822 oraz
+   jawny zapis załączników. Wszystkie wyniki pozostają oznaczone jako
+   niezaufane; raw ma limit 2 MiB, a zapis załączników 10 plików po 5 MiB.
+5. Wyszukiwanie pełnej treści (`searchBody`) nie jest wystawione.
+6. Wyniki są ograniczone rozmiarem, czyszczone ze znaków sterujących i
+   opatrzone strukturalnym polem zaufania. Ciągi przypominające znaczniki
+   graniczne są kodowane, ale klient nadal musi egzekwować politykę dla
+   niezaufanych danych.
+7. Schemat i dispatcher odrzucają ścieżki do wychodzących załączników. Dozwolone
+   są wyłącznie obiekty inline base64. Pliki przychodzące trafiają do prywatnego
+   katalogu profilu i są usuwane przy zamknięciu dodatku.
+8. Serwer wiąże się wyłącznie z pętlą zwrotną.
+9. 256-bitowy token jest generowany od nowa przy każdym starcie serwera.
+10. Każdy profil ma losowy, trwały identyfikator i własny katalog
+    `thunderbird-mcp-safe/<profile-id>` w trybie `0700`; plik połączenia ma
+    tryb `0600`. Identyfikator jest powiązany z kanoniczną ścieżką `ProfD`;
+    kopia lub przeniesienie profilu otrzymuje nowy identyfikator.
+11. Mostek wymaga dokładnej ścieżki
+    `THUNDERBIRD_MCP_CONNECTION_FILE`. W ścieżce wykonawczej nie skanuje
+    profili ani nie przełącza się na inny plik. Przed użyciem połączenia
+    sprawdza również, czy PID zapisany przez dodatek nadal istnieje; stary plik
+    po awarii jest odrzucany bez wysyłania żądania na zapisany port.
+12. Fork nie ma `update_url`, generatora aktualizacji ani workflow publikacji.
+13. `sendMail`, odpowiedź i przekazanie zawsze otwierają okno podglądu.
+    Osobne `sendMailDirect` jest ukryte i blokowane, dopóki lokalna konfiguracja
+    nie zawiera jawnego włączenia, kont nadawczych, reguł odbiorców oraz limitów.
+    Narzędzie wymaga jawnej tożsamości nadawcy, sprawdza wszystkich odbiorców
+    `to`/`cc`/`bcc`, odrzuca globalny wildcard, rezerwuje dzienny limit przed
+    transportem i przyjmuje najwyżej trzy załączniki inline. Zwykły
+    `sendMail` nie dziedziczy tej zdolności.
+14. Każda zaakceptowana próba `sendMailDirect` jest przed transportem zapisywana
+    w prywatnym pliku `direct-send-audit.jsonl`; wpis zawiera identyfikator,
+    konto, odbiorców, rozmiary pól i liczbę załączników, ale nie temat ani treść.
+    Błąd pierwszego wpisu albo osiągnięcie limitu pliku 5 MiB blokuje wysyłkę.
+15. Kasowanie wiadomości i folderów wymaga `confirmTrash: true`, działa
+    maksymalnie na 50 wiadomościach i zawsze kopiuje/przenosi do Kosza.
+    Wywołanie na zawartości Kosza jest odrzucane.
+16. Filtry można listować, tworzyć, aktualizować, wyłączać i usuwać w
+    ograniczonym modelu. MCP tworzy je zawsze wyłączone i może zmieniać tylko
+    reguły oznaczone losowym identyfikatorem tego forka. Nie istnieje narzędzie
+    do włączania, uruchamiania ani zmiany kolejności reguł.
+17. Zmiana nazwy, przenoszenie i usuwanie chronionych folderów systemowych
+    (m.in. Inbox, Sent, Drafts, Trash i Junk) są odrzucane.
+18. Mutacja filtra wymaga niejawnego identyfikatora i aktualnej rewizji.
+    Niekompletne, nierozpoznane, tymczasowe, grupowane lub ręcznie rozszerzone
+    definicje są tylko do odczytu. Zmiana definicji i usunięcie wymagają reguły
+    wyłączonej.
+19. Akcje filtrów są ograniczone do przeniesienia/kopiowania w obrębie tego
+    samego konta, flag stanu wiadomości i istniejących etykiet. Folder docelowy
+    nie może być korzeniem, folderem wirtualnym, Koszem, Spamem ani ich
+    potomkiem i musi przyjmować wiadomości.
+20. Przed każdą mutacją filtra wykonywana jest trwała kopia źródłowego pliku
+    oraz wpis `prepared` do prywatnego dziennika. Po udanym zapisie dochodzi
+    wpis `committed`. Kopie i audyt są przechowywane poza katalogiem
+    tymczasowym w katalogu aplikacji użytkownika, z trybami `0700`/`0600`,
+    limitem 20 kopii i 5 MiB na plik.
+21. Kalendarze, zadania, opróżnianie Kosza/Spamu i kasowanie kontaktów nie
+    należą do białej listy.
+22. `createFolder` czeka na natywne zdarzenie zakończenia operacji i nie zwraca
+    sukcesu bez niepustego URI, ponownego rozwiązania folderu oraz — dla IMAP —
+    potwierdzenia `verifiedAsOnlineFolder`. Timeout daje stan `unconfirmed`,
+    więc nie może zostać użyty jako cel reguły. Dla IMAP używa operacji
+    create-or-subscribe: istniejący, lecz niesubskrybowany folder zostaje
+    ujawniony zamiast wejścia w pętlę błędów `FolderCreateFailed`. Operacja
+    dostaje kontekst aktywnego okna poczty, aby uwierzytelnienie dostawcy IMAP
+    mogło zakończyć callback. Listener implementuje wymagane przez
+    `nsIUrlListener` metody `OnStartRunningUrl` i `OnStopRunningUrl`, dlatego
+    odrzucenie przez serwer jest zwracane od razu zamiast zamieniać się w
+    timeout. Filtry IMAP ponownie sprawdzają potwierdzenie online przed zapisem
+    definicji.
 
-This project bridges three trust boundaries; any of them is in scope:
+## Jawnie poza zakresem
 
-1. **JSON-RPC over stdin** to `mcp-bridge.cjs`. Adversarial input
-   includes malformed JSON, oversized payloads, control characters,
-   prototype pollution attempts.
-2. **HTTP transport** between the bridge and the Thunderbird
-   extension (`http://localhost:<port>` with token auth). Token
-   handling, timing-safe comparison, port-binding hygiene.
-3. **Tool dispatch inside the extension** (`extension/mcp_server/lib/`).
-   The permission engine + per-tool argument validation are the
-   primary boundary. Any path that lets a caller exceed their
-   declared permission scope, or that accesses Thunderbird state
-   outside the permission's intent (e.g. reading another account's
-   mailbox via a tool that should only see Inbox), is in scope.
-4. **Native messaging / WebExtension experiment surface**. The
-   extension runs in Thunderbird's chrome context with XPCOM
-   privileges -- any path that leaks XPCOM capabilities to an
-   unauthenticated caller is in scope.
+- ochrona przed złośliwym procesem uruchomionym jako ten sam użytkownik;
+- szyfrowanie profilu Thunderbirda na dysku;
+- polityka retencji lub trenowania po stronie dostawcy modelu;
+- gwarancja, że zwykły odczyt IMAP nie zmieni lokalnego cache/indeksu;
+- audyt wszystkich wywołań w odpornym na modyfikację dzienniku; istniejące
+  dzienniki obejmują automatyczną wysyłkę i mutacje filtrów, ale mogą zostać
+  zmienione przez proces działający jako ten sam użytkownik;
+- formalna weryfikacja kodu lub niezależny audyt zewnętrzny.
 
-## What's out of scope
+## Kryteria akceptacji pilota
 
-- DoS against `mcp-bridge.cjs` from a process that already has
-  local-user trust (the bridge runs in the user's session; that's
-  the threat model's TCB by design).
-- Behaviour of `npm audit` / `dependabot` flagged transitive deps
-  unless there is a confirmed runtime-exploitable path. We ship
-  no production npm `dependencies`; only devDeps are exposed.
-- Pre-release / unmerged feature branches. Report against `main`
-  or the latest release.
+- cały zestaw testów Node kończy się kodem `0`;
+- lint nie zgłasza błędów;
+- build XPI kończy się kodem `0`;
+- dwa kolejne buildy niezmienionych źródeł dają bajtowo identyczne XPI;
+- zawartość XPI nie ma `update_url`, nadmiarowych uprawnień ani starej strony
+  opcji;
+- krytyczne pliki `manifest.json`, `mcp_server/api.js` i
+  `mcp_server/schema.json` w XPI są bajtowo zgodne z audytowanym źródłem;
+- test na osobnym profilu Thunderbirda pokazuje brak dostępnych kont i
+  kontaktów przed wyborem konta oraz książki adresowej;
+- dwa profile mają różne identyfikatory i różne pliki połączenia, a mostek
+  przypięty do jednego pliku nie przełącza się na drugi;
+- `sendMail`, odpowiedź i przekazanie otwierają okno podglądu;
+- przy wyłączonej polityce `sendMailDirect` nie występuje w `tools/list`;
+- błędna polityka, niedozwolone konto lub odbiorca, przekroczony limit albo
+  niedostępny dziennik blokują `sendMailDirect` przed transportem;
+- `deleteMessages` i `deleteFolder` przenoszą wyłącznie do Kosza, a próba
+  działania wewnątrz Kosza jest odrzucana;
+- `createFolder` na testowym IMAP zwraca niepusty, zweryfikowany URI dopiero po
+  pojawieniu się folderu na serwerze; potrafi odzyskać istniejący,
+  niesubskrybowany folder, błąd URL jest obsługiwany przez natywne nazwy metod
+  listenera, a błąd i timeout nigdy nie zwracają `success: true`; folder
+  najwyższego poziomu można utworzyć przez `accountId`;
+- utworzona przez MCP syntetyczna reguła pozostaje wyłączona po restarcie,
+  zachowuje rewizję, odrzuca nieaktualną rewizję, może zostać zaktualizowana i
+  usunięta, a kopie bezpieczeństwa i audyt pozostają trwałe;
+- MCP nie potrafi włączyć ani uruchomić filtra, a próby użycia niedozwolonych
+  akcji, innego konta, folderu wirtualnego/Kosza/Spamu lub nieistniejącej
+  etykiety są odrzucane przed zapisem;
+- `rawSource` jest ucinany lub odrzucany powyżej limitu, zapisane załączniki
+  nie przekraczają limitów, a `searchBody`, host-path attachments i nasłuch
+  poza localhostem są odrzucane;
+- po restarcie token w pliku połączenia jest inny;
+- po wymuszonym zakończeniu stary plik połączenia jest odrzucany na podstawie
+  nieaktywnego PID-u, a restart Thunderbirda przywraca połączenie przez
+  przepisanie tego samego przypiętego pliku;
+- dopiero po tych punktach można rozważyć instalację w profilu produkcyjnym.
 
-## Coordinated disclosure
+## Zgłaszanie problemów
 
-We follow the Mozilla / Thunderbird coordinated-disclosure cadence
-where the issue intersects upstream Thunderbird internals. If your
-finding touches `nsIMsgSend`, `nsIMsgCompose`, or other XPCOM
-interfaces, we may forward (with credit) to
-[Mozilla's security team](https://www.mozilla.org/en-US/security/)
-or open a Bugzilla report on your behalf. We'll always coordinate
-disclosure timing with you before doing so.
-
-## Recognition
-
-Researchers who report verified vulnerabilities are credited in the
-release notes for the patch release that fixes the issue, unless
-they request to remain anonymous.
+Nie wysyłaj do upstreamu przykładów zawierających prawdziwe dane pocztowe,
+tokeny ani ścieżki profilu. Reprodukcję przygotuj na syntetycznej wiadomości i
+osobnym profilu testowym.
