@@ -2551,7 +2551,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Email body text" },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true only when body contains HTML markup. Plain-text bodies still use the sender identity's configured compose format." },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
@@ -2664,7 +2664,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Email body (optional)" },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true only when body contains HTML markup. Plain-text bodies still use the sender identity's configured compose format." },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             attachments: {
               type: "array",
@@ -2921,7 +2921,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             body: { type: "string", description: "Reply body text" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true only when body contains HTML markup. Plain-text bodies still use the sender identity's configured compose format." },
             to: { type: "string", description: "Override recipient email (default: original sender)" },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
@@ -2968,7 +2968,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             to: { type: "string", description: "Recipient email address" },
             body: { type: "string", description: "Additional text to prepend (optional)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true only when body contains HTML markup. Plain-text bodies still use the sender identity's configured compose format." },
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
@@ -5014,33 +5014,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Decides whether a compose operation will (or should) run in HTML
              * mode, and returns the matching msgComposeParams.format value.
              *
-             * The caller's explicit isHtml wins (true/false). When isHtml is
-             * omitted, the identity's compose-format preference is consulted.
+             * isHtml describes the input body's shape, not the requested editor
+             * mode. HTML input forces an HTML editor; plain input follows the
+             * identity's compose-format preference and is escaped when needed.
              *
              * ForwardInline is a special case: Thunderbird's compose service
              * only passes format through when it's Default or OppositeOfDefault
-             * for that compType, so when the caller's explicit isHtml conflicts
-             * with the identity pref on a forward, we have to ask for
-             * OppositeOfDefault instead of HTML/PlainText.
+             * for that compType, so HTML input for a plain-text identity has to
+             * ask for OppositeOfDefault rather than HTML.
              *
              * Identity must be resolved (setComposeIdentity) before calling this.
              */
             function resolveComposeFormat(identity, isHtml, compType) {
               const identityUsesHtml = identity?.composeHtml !== false;
-              const useHtml = isHtml === true || (isHtml !== false && identityUsesHtml);
+              const useHtml = isHtml === true || identityUsesHtml;
               const isForward = compType === Ci.nsIMsgCompType.ForwardInline
                              || compType === Ci.nsIMsgCompType.ForwardAsAttachment;
 
               let format;
-              if (isHtml === undefined) {
-                format = Ci.nsIMsgCompFormat.Default;
-              } else if (isForward) {
-                const explicitMatchesPref = (isHtml === true) === identityUsesHtml;
-                format = explicitMatchesPref
-                  ? Ci.nsIMsgCompFormat.Default
-                  : Ci.nsIMsgCompFormat.OppositeOfDefault;
+              if (isHtml === true && !identityUsesHtml) {
+                format = isForward
+                  ? Ci.nsIMsgCompFormat.OppositeOfDefault
+                  : Ci.nsIMsgCompFormat.HTML;
               } else {
-                format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.PlainText;
+                format = Ci.nsIMsgCompFormat.Default;
               }
               return { useHtml, format };
             }

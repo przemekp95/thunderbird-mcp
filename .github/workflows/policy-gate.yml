@@ -1,0 +1,23 @@
+name: Policy gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+      - name: Install development dependencies
+        run: npm install --no-package-lock
+      - name: Run canonical repository verification
+        run: ./.codex/verify

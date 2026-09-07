@@ -143,7 +143,6 @@ describe('Auth: connection info file', () => {
   after(() => restoreConnectionFile());
 
   it('bridge reads port and token from connection.json', async () => {
-    const TEST_PORT = 18765;
     const TEST_TOKEN = 'a'.repeat(64);
     let receivedHeaders = null;
     let receivedPort = null;
@@ -151,7 +150,7 @@ describe('Auth: connection info file', () => {
     // Start a mock server on the test port
     const server = http.createServer((req, res) => {
       receivedHeaders = req.headers;
-      receivedPort = TEST_PORT;
+      receivedPort = req.socket.localPort;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         jsonrpc: '2.0',
@@ -162,12 +161,13 @@ describe('Auth: connection info file', () => {
 
     await new Promise((resolve, reject) => {
       server.on('error', reject);
-      server.listen(TEST_PORT, '127.0.0.1', resolve);
+      server.listen(0, '127.0.0.1', resolve);
     });
+    const testPort = server.address().port;
 
     try {
       // Write connection info pointing to our mock server
-      writeTestConnectionInfo(TEST_PORT, TEST_TOKEN);
+      writeTestConnectionInfo(testPort, TEST_TOKEN);
 
       const response = await sendToBridge({
         jsonrpc: '2.0',
@@ -176,7 +176,7 @@ describe('Auth: connection info file', () => {
       });
 
       // Verify the bridge connected to our mock server (correct port)
-      assert.equal(receivedPort, TEST_PORT);
+      assert.equal(receivedPort, testPort);
 
       // Verify the auth token was sent
       assert.equal(receivedHeaders['authorization'], `Bearer ${TEST_TOKEN}`);
