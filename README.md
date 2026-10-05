@@ -11,8 +11,8 @@ zdalnego upstreamu jest lokalnie wyłączony.
 
 ## Co jest dostępne
 
-MCP domyślnie publikuje dokładnie 27 narzędzi. Po osobnym lokalnym włączeniu
-`sendMailDirect` liczba rośnie do 28:
+MCP domyślnie publikuje dokładnie 30 narzędzi. Po osobnym lokalnym włączeniu
+`sendMailDirect` liczba rośnie do 31:
 
 - odczyt: `listAccounts`, `listFolders`, `searchMessages`,
   `getRecentMessages`, `getMessage`, `getMessages`, `displayMessage`,
@@ -22,6 +22,8 @@ MCP domyślnie publikuje dokładnie 27 narzędzi. Po osobnym lokalnym włączeni
 - organizacja: `updateMessage`, `deleteMessages`, `createFolder`,
   `renameFolder`, `deleteFolder`, `moveFolder`;
 - kontakty: `searchContacts`, `getContact`, `createContact`, `updateContact`.
+- okna: `listThunderbirdWindows`, `closeThunderbirdWindow` oraz `respondToSmtpPrompt` dla wybranego,
+  otwartego monitu hasła SMTP.
 - filtry: `listFilters`, `createFilter`, `updateFilter`, `disableFilter`,
   `deleteFilter`.
 
@@ -38,15 +40,35 @@ base64; ścieżki do plików komputera są odrzucane w schemacie i dispatcherze.
 
 `sendMailDirect` jest osobnym narzędziem i pozostaje ukryte, dopóki użytkownik
 nie włączy go w opcjach dodatku. Włączenie wymaga frazy `ENABLE DIRECT SEND`,
-co najmniej jednego jawnie wybranego konta nadawczego, reguły odbiorcy,
-limitu odbiorców na wiadomość oraz dziennego limitu zaakceptowanych prób.
-Reguła odbiorcy może być dokładnym adresem albo domeną w formie
-`*@example.com`; globalny wildcard nie istnieje. Każda zaakceptowana próba i
+co najmniej jednego jawnie wybranego konta nadawczego, limitu odbiorców na
+wiadomość oraz dziennego limitu zaakceptowanych prób. Lista reguł odbiorców
+jest opcjonalna: pusta dopuszcza dowolny poprawny składniowo adres, a niepusta
+ogranicza wysyłkę do dokładnych adresów lub domen w formie `*@example.com`.
+Każda zaakceptowana próba i
 jej wynik trafiają do prywatnego lokalnego dziennika bez tematu i treści
-wiadomości. Automatyczna wysyłka dopuszcza najwyżej trzy załączniki inline i
+wiadomości. Automatyczna wysyłka nie ogranicza liczby załączników inline, ale
 blokuje całą wiadomość, jeśli przygotowanie któregokolwiek z nich się nie uda.
 Dziennik ma limit 5 MiB; po jego osiągnięciu automatyczna wysyłka zatrzymuje się
 do czasu świadomej archiwizacji lub usunięcia dziennika przez użytkownika.
+
+Gdy Thunderbird nie ma działającego hasła serwera poczty wychodzącej,
+`sendMailDirect` przyjmuje opcjonalne `smtpPassword` dla jednej próby wysyłki.
+Przekazuje je bezpośrednio do natywnej funkcji wysyłania Thunderbirda; dodatek
+nie zapisuje go w swoich preferencjach ani dzienniku audytu. Argument narzędzia
+może jednak zostać zachowany w historii klienta MCP, dlatego do zwykłej pracy
+lepiej używać menedżera haseł Thunderbirda. Samo podanie hasła nie włącza
+`sendMailDirect` ani nie omija limitów kont i odbiorców.
+
+`listThunderbirdWindows` podaje tymczasowe identyfikatory okien poczty,
+podglądu wiadomości, edytorów i monitów Thunderbirda, ale nie odczytuje zawartości pól hasła.
+`closeThunderbirdWindow` zamyka wyłącznie wskazany osobny podgląd wiadomości.
+Sprawdza aktualny identyfikator oraz zamknięcie okna; nie zamyka głównego
+okna poczty, edytorów ani dialogów i nie wysyła ani nie usuwa wiadomości.
+`respondToSmtpPrompt` wpisuje hasło i naciska OK tylko w żywym oknie typu
+`promptPassword`, którego tytuł zawiera `SMTP` i nazwę skonfigurowanego
+serwera poczty wychodzącej. Opcjonalne `rememberPassword` zaznacza pole
+menedżera haseł w tym oknie. Nie obsługuje dowolnych okien ani przycisków.
+Po odpowiedzi trzeba osobno sprawdzić wynik wysyłki w folderze „Wysłane”.
 
 Filtry mają odrębny, ograniczony model bezpieczeństwa. `listFilters` pokazuje
 reguły na dozwolonych kontach, ale pozostałe cztery narzędzia mogą zmieniać
@@ -85,8 +107,7 @@ folder jako istniejący online.
 ## Czego ta wersja nie potrafi
 
 - wysyłać automatycznie bez wcześniejszego lokalnego włączenia oraz zgodności
-  konta, wszystkich odbiorców i limitów z polityką;
-- zezwalać jednym wildcardem na wszystkich odbiorców;
+  konta, opcjonalnych ograniczeń odbiorców i limitów z polityką;
 - usuwać trwale wiadomości, folderów ani kontaktów;
 - opróżniać Kosza lub folderu Spam;
 - automatycznie włączać, uruchamiać lub zmieniać kolejności filtrów;
@@ -101,7 +122,7 @@ folder jako istniejący online.
 
 Brak wybranego konta oznacza brak dostępu do wszystkich kont. Kontakty mają
 osobną białą listę: brak wybranej książki adresowej blokuje wszystkie kontakty.
-Nie istnieje tryb „pusta lista = wszystko”.
+Dla list kont i książek adresowych nie istnieje tryb „pusta lista = wszystko”.
 
 ## Budowanie i testy
 
@@ -131,8 +152,10 @@ identyczny SHA-256; sprawdza to również automatyczny test.
 3. Otwórz ustawienia `Thunderbird MCP Safe`.
 4. Wybierz konto oraz książkę adresową przeznaczone do pilota. Te dwie listy
    są niezależne i domyślnie puste.
-5. Opcjonalne `sendMailDirect` włącz dopiero po wpisaniu kont nadawczych,
-   reguł odbiorców i limitów. Bez tego narzędzie nie pojawia się w `tools/list`.
+5. Opcjonalne `sendMailDirect` włącz dopiero po wybraniu kont nadawczych i
+   ustawieniu limitów. Pustą listę odbiorców pozostaw tylko wtedy, gdy narzędzie
+   ma wysyłać do dowolnego poprawnego adresu; wpisanie reguł zawęża ten zakres.
+   Bez włączenia narzędzie nie pojawia się w `tools/list`.
 6. W sekcji `Local server` skopiuj dokładną wartość `Connection file`. Każdy
    profil Thunderbirda dostaje osobny losowy `Safe profile ID` i osobny plik.
    Identyfikator jest związany z kanoniczną ścieżką profilu, więc skopiowanie

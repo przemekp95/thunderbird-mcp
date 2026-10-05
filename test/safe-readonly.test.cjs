@@ -41,6 +41,9 @@ const EXPECTED_SAFE_TOOLS = [
   "getMessage",
   "getMessages",
   "displayMessage",
+  "listThunderbirdWindows",
+  "closeThunderbirdWindow",
+  "respondToSmtpPrompt",
   "sendMail",
   "sendMailDirect",
   "saveDraft",
@@ -78,7 +81,7 @@ function loadSafePolicy() {
     "// BEGIN SAFE READ-ONLY POLICY",
     "// END SAFE READ-ONLY POLICY"
   );
-  const sandbox = { DIRECT_SEND_MAX_ATTACHMENTS: 3 };
+  const sandbox = {};
   vm.createContext(sandbox);
   vm.runInContext(
     `${snippet}
@@ -364,6 +367,7 @@ describe("compile-time reviewed MCP capability policy", () => {
             subject: { type: "string" },
             body: { type: "string" },
             from: { type: "string" },
+            smtpPassword: { type: "string" },
             skipReview: { type: "boolean" },
             attachments: inlineAttachmentSchema,
           },
@@ -456,13 +460,15 @@ describe("compile-time reviewed MCP capability policy", () => {
 
     const sendMail = safe.find((tool) => tool.name === "sendMail");
     assert.ok(!Object.hasOwn(sendMail.inputSchema.properties, "skipReview"));
+    assert.ok(!Object.hasOwn(sendMail.inputSchema.properties, "smtpPassword"));
     assert.equal(sendMail.inputSchema.properties.attachments.items.type, "object");
     assert.ok(!Object.hasOwn(sendMail.inputSchema.properties.attachments.items, "oneOf"));
 
     const sendMailDirect = safe.find((tool) => tool.name === "sendMailDirect");
     assert.ok(!Object.hasOwn(sendMailDirect.inputSchema.properties, "skipReview"));
     assert.equal(sendMailDirect.inputSchema.properties.attachments.items.type, "object");
-    assert.equal(sendMailDirect.inputSchema.properties.attachments.maxItems, 3);
+    assert.ok(!Object.hasOwn(sendMailDirect.inputSchema.properties.attachments, "maxItems"));
+    assert.equal(sendMailDirect.inputSchema.properties.smtpPassword.type, "string");
     assert.ok(sendMailDirect.inputSchema.required.includes("from"));
 
     const deleteMessages = safe.find((tool) => tool.name === "deleteMessages");

@@ -738,7 +738,6 @@ const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data 
 // Prevents an MCP caller from attaching multi-GB files to a single outgoing message.
 const MAX_FILE_PATH_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-const MAX_ATTACHMENTS_PER_MESSAGE = 20;
 const SAFE_INCOMING_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
 const SAFE_INCOMING_ATTACHMENT_MAX_COUNT = 10;
 // END OUTBOUND ATTACHMENT LIMITS
@@ -1010,7 +1009,6 @@ const DIRECT_SEND_DEFAULT_MAX_RECIPIENTS = 1;
 const DIRECT_SEND_DEFAULT_DAILY_LIMIT = 10;
 const DIRECT_SEND_MAX_RECIPIENTS_HARD_CAP = 10;
 const DIRECT_SEND_DAILY_LIMIT_HARD_CAP = 100;
-const DIRECT_SEND_MAX_ATTACHMENTS = 3;
 const DIRECT_SEND_MAX_SUBJECT_CHARS = 998;
 const DIRECT_SEND_MAX_BODY_CHARS = 200000;
 const DIRECT_SEND_MAX_HEADER_CHARS = 4000;
@@ -1185,10 +1183,6 @@ function validateDirectSendSettings(settings, accessibleAccountIds) {
   if (enabled && accountResult.values.length === 0) {
     return { error: "At least one direct-send account is required when enabled" };
   }
-  if (enabled && allowedRecipients.length === 0) {
-    return { error: "At least one direct-send recipient rule is required when enabled" };
-  }
-
   return {
     enabled,
     allowedAccountIds: accountResult.values,
@@ -1216,9 +1210,11 @@ function evaluateDirectSendRequest(config, request, usedToday) {
       error: `Direct sending allows at most ${config.maxRecipientsPerMessage} recipient(s) per message`,
     };
   }
-  const denied = parsed.recipients.filter(mailbox =>
-    !config.allowedRecipients.some(rule => directSendRuleMatches(mailbox, rule))
-  );
+  const denied = config.allowedRecipients.length > 0
+    ? parsed.recipients.filter(mailbox =>
+        !config.allowedRecipients.some(rule => directSendRuleMatches(mailbox, rule))
+      )
+    : [];
   if (denied.length > 0) {
     return { error: `Recipient is not allowed for direct sending: ${denied.join(", ")}` };
   }
@@ -1744,6 +1740,9 @@ const SAFE_TOOL_NAMES = new Set([
   "getMessage",
   "getMessages",
   "displayMessage",
+  "listThunderbirdWindows",
+  "closeThunderbirdWindow",
+  "respondToSmtpPrompt",
   "sendMail",
   "sendMailDirect",
   "saveDraft",
@@ -1795,7 +1794,6 @@ function pickSchemaProperties(properties, allowedNames) {
 function buildSafeToolDefinitions(allTools) {
   const inlineAttachmentSchema = {
     type: "array",
-    maxItems: 10,
     description: "Inline attachment data only. Host file paths are not accepted.",
     items: {
       type: "object",
@@ -1928,15 +1926,12 @@ function buildSafeToolDefinitions(allTools) {
         );
       } else if (tool.name === "sendMailDirect") {
         delete safeTool.inputSchema.properties.skipReview;
-        safeTool.description = "Send immediately without opening a compose window. This tool is hidden and blocked unless the user enables direct sending for the sender account and recipient allow-list in Thunderbird settings. Every accepted attempt consumes daily quota and is written to a private local audit log.";
+        safeTool.description = "Send immediately without opening a compose window. This tool is hidden and blocked unless the user enables direct sending for the sender account in Thunderbird settings. An optional recipient list can narrow delivery; an empty list permits any syntactically valid recipient. Every accepted attempt consumes daily quota and is written to a private local audit log.";
         safeTool.inputSchema.properties = pickSchemaProperties(
           safeTool.inputSchema.properties,
-          ["to", "subject", "body", "cc", "bcc", "isHtml", "from", "attachments"]
+          ["to", "subject", "body", "cc", "bcc", "isHtml", "from", "attachments", "smtpPassword"]
         );
-        safeTool.inputSchema.properties.attachments = {
-          ...inlineAttachmentSchema,
-          maxItems: DIRECT_SEND_MAX_ATTACHMENTS,
-        };
+        safeTool.inputSchema.properties.attachments = inlineAttachmentSchema;
         safeTool.inputSchema.required = ["to", "subject", "body", "from"];
       } else if (["sendMail", "saveDraft", "replyToMessage", "forwardMessage"].includes(tool.name)) {
         delete safeTool.inputSchema.properties.skipReview;
@@ -2371,6 +2366,138 @@ function hardenMessageBatchResult(result, options = {}) {
 }
 // END SAFE READ-ONLY POLICY
 
+// BEGIN THUNDERBIRD WINDOW CONTROLS
+// Window handles are scoped to this running extension instance. A handle is
+// invalidated when its window closes, so a later prompt cannot inherit it.
+const thunderbirdWindowIds = new WeakMap();
+const thunderbirdWindowsById = new Map();
+let nextThunderbirdWindowId = 1;
+
+function configuredSmtpHosts() {
+  const hosts = new Set();
+  try {
+    for (const pref of Services.prefs.getChildList("mail.smtpserver.")) {
+      if (!/^mail\.smtpserver\.[^.]+\.hostname$/.test(pref)) continue;
+      const host = Services.prefs.getStringPref(pref, "").trim().toLowerCase();
+      if (host) hosts.add(host);
+    }
+  } catch {
+    // If SMTP settings cannot be read, no password prompt may be acted on.
+  }
+  return hosts;
+}
+
+function describeThunderbirdWindow(win, smtpHosts) {
+  if (!win || win.closed) return null;
+  const doc = win.document;
+  if (!doc) return null;
+  const uri = String(doc.documentURI || "");
+  const windowType = String(doc.documentElement?.getAttribute("windowtype") || "");
+  const title = String(doc.title || "").slice(0, 300);
+  let kind;
+  if (windowType === "mail:3pane") kind = "mail";
+  else if (windowType === "mail:messageWindow" &&
+           uri === "chrome://messenger/content/messageWindow.xhtml") kind = "message";
+  else if (windowType === "msgcompose") kind = "compose";
+  else if (uri === "chrome://messenger/content/messenger/commonDialog.xhtml" ||
+           uri === "chrome://global/content/commonDialog.xhtml") {
+    kind = "dialog";
+    if (windowType === "prompt:promptPassword" && /smtp/i.test(title)) {
+      const lowerTitle = title.toLowerCase();
+      if ([...smtpHosts].some(host => lowerTitle.includes(host))) {
+        kind = "smtpPasswordPrompt";
+      }
+    }
+  } else return null;
+  return { kind, title, windowType };
+}
+
+function currentThunderbirdWindows() {
+  const open = new Set();
+  const result = [];
+  const smtpHosts = configuredSmtpHosts();
+  for (const win of Services.wm.getEnumerator(null)) {
+    const descriptor = describeThunderbirdWindow(win, smtpHosts);
+    if (!descriptor) continue;
+    open.add(win);
+    let id = thunderbirdWindowIds.get(win);
+    if (!id) {
+      id = `tb-window-${nextThunderbirdWindowId++}`;
+      thunderbirdWindowIds.set(win, id);
+      thunderbirdWindowsById.set(id, win);
+    }
+    result.push({ windowId: id, ...descriptor });
+    if (result.length >= 30) break;
+  }
+  for (const [id, win] of thunderbirdWindowsById) {
+    if (!open.has(win)) thunderbirdWindowsById.delete(id);
+  }
+  return result;
+}
+
+function listThunderbirdWindows() {
+  return { windows: currentThunderbirdWindows() };
+}
+
+function closeThunderbirdWindow(windowId) {
+  if (typeof windowId !== "string" || !/^tb-window-[1-9][0-9]*$/.test(windowId) || windowId.length > 64) {
+    return { success: false, error: "Invalid window ID" };
+  }
+  const row = currentThunderbirdWindows().find(entry => entry.windowId === windowId);
+  if (!row || row.kind !== "message") {
+    return { success: false, error: "Only a live standalone message preview can be closed" };
+  }
+  const win = thunderbirdWindowsById.get(windowId);
+  try {
+    win.close();
+  } catch {
+    return { success: false, error: "Could not close the selected message preview" };
+  }
+  if (!win.closed) {
+    return { success: false, error: "Thunderbird did not close the selected message preview" };
+  }
+  thunderbirdWindowsById.delete(windowId);
+  return { success: true, windowId, closed: true };
+}
+
+function respondToSmtpPrompt(windowId, password, rememberPassword = false) {
+  if (typeof windowId !== "string" || typeof password !== "string" ||
+      password.length < 1 || password.length > 1024 || typeof rememberPassword !== "boolean") {
+    return { success: false, error: "Invalid window ID or password" };
+  }
+  const row = currentThunderbirdWindows().find(entry => entry.windowId === windowId);
+  if (!row || row.kind !== "smtpPasswordPrompt") {
+    return { success: false, error: "Selected window is not a live SMTP password prompt" };
+  }
+  const win = thunderbirdWindowsById.get(windowId);
+  const field = win?.document?.getElementById("password1Textbox");
+  const button = win?.document?.getElementById("commonDialog")?.getButton("accept");
+  if (field?.type !== "password" || !button || button.disabled) {
+    return { success: false, error: "SMTP prompt controls are unavailable" };
+  }
+  if (rememberPassword) {
+    const checkbox = win.document.getElementById("checkbox");
+    const container = win.document.getElementById("checkboxContainer");
+    if (!checkbox || !container || container.hidden) {
+      return { success: false, error: "Password-manager checkbox is unavailable" };
+    }
+    if (!checkbox.checked) checkbox.click();
+    if (!checkbox.checked) {
+      return { success: false, error: "Could not select the password-manager checkbox" };
+    }
+  }
+  field.value = password;
+  try {
+    button.click();
+  } catch {
+    field.value = "";
+    return { success: false, error: "Could not submit the SMTP prompt" };
+  }
+  thunderbirdWindowsById.delete(windowId);
+  return { success: true, message: "SMTP password submitted to the selected Thunderbird dialog" };
+}
+// END THUNDERBIRD WINDOW CONTROLS
+
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
     const extensionRoot = context.extension.rootURI;
@@ -2442,6 +2569,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         birthday: { type: "string", description: "Birthday as YYYY-MM-DD or --MM-DD when the year is unknown" },
       };
       return [
+      {
+        name: "listThunderbirdWindows",
+        group: "system", crud: "read",
+        title: "List Thunderbird Windows",
+        description: "List open Thunderbird mail, standalone message preview, compose, and common dialog windows with temporary IDs. Password field values are never returned.",
+        inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+      },
+      {
+        name: "closeThunderbirdWindow",
+        group: "system", crud: "update",
+        title: "Close Thunderbird Message Preview",
+        description: "Close one explicitly selected standalone message preview using its temporary ID from listThunderbirdWindows. Main mail windows, compose editors and dialogs cannot be closed. Does not send or delete mail.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            windowId: { type: "string", minLength: 1, maxLength: 64, description: "Temporary ID of a message preview from listThunderbirdWindows" },
+          },
+          required: ["windowId"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "respondToSmtpPrompt",
+        group: "system", crud: "update",
+        title: "Respond to SMTP Password Prompt",
+        description: "Enter a password in one selected, live Thunderbird SMTP password dialog and press its OK button. Can select Thunderbird's password-manager checkbox. Does not confirm that email was sent; check Sent separately. Password is not stored or returned by this extension.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            windowId: { type: "string", minLength: 1, maxLength: 64, description: "Temporary ID from listThunderbirdWindows" },
+            password: { type: "string", minLength: 1, maxLength: 1024, description: "Password for the selected SMTP prompt" },
+            rememberPassword: { type: "boolean", description: "Select Thunderbird's password-manager checkbox before accepting (default: false)" },
+          },
+          required: ["windowId", "password"],
+          additionalProperties: false,
+        },
+      },
       {
         name: "listAccounts",
         group: "system", crud: "read",
@@ -2556,7 +2720,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
               type: "array",
-              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -2627,9 +2790,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               maxLength: 320,
               description: "Required sender identity email or identity ID from listAccounts",
             },
+            smtpPassword: {
+              type: "string",
+              minLength: 1,
+              maxLength: 1024,
+              description: "Optional SMTP password for this send only. Passed to Thunderbird's native send; not saved by this extension or included in its audit log.",
+            },
             attachments: {
               type: "array",
-              maxItems: DIRECT_SEND_MAX_ATTACHMENTS,
               description: "Inline attachment objects only",
               items: {
                 type: "object",
@@ -2668,7 +2836,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             attachments: {
               type: "array",
-              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -2929,7 +3096,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
               type: "array",
-              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -2975,7 +3141,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
               type: "array",
-              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -4021,13 +4186,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const descs = [];
               const failed = [];
               if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
-              let attachmentEntries = filePaths;
-              if (filePaths.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-                failed.push(`Attachment count ${filePaths.length} exceeds the ${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit; skipped ${filePaths.length - MAX_ATTACHMENTS_PER_MESSAGE} attachment(s)`);
-                attachmentEntries = filePaths.slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
-              }
               let totalAttachmentBytes = 0;
-              for (const entry of attachmentEntries) {
+              for (const entry of filePaths) {
                 try {
                   if (typeof entry === "string") {
                     // File path attachment.
@@ -4594,7 +4754,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * We try the modern 16-arg call first; if TB throws
              * NS_ERROR_XPC_NOT_ENOUGH_ARGS, fall back to the legacy 18-arg call.
              */
-            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType) {
+            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType, smtpPassword = "") {
               if (!identity) {
                 return Promise.resolve({ error: "No identity available for direct send" });
               }
@@ -4715,7 +4875,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     null,                           // parent window
                     null,                           // progress
                     listener,                       // listener
-                    "",                             // password
+                    smtpPassword,                   // transient SMTP password
                     originalMsgURI || "",           // original msg URI
                     compType,                       // compose type
                   ];
@@ -7973,6 +8133,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               ) {
                 return { error: "Direct-send subject or body exceeds the configured safety limit" };
               }
+              if (args.smtpPassword !== undefined && (
+                typeof args.smtpPassword !== "string" ||
+                args.smtpPassword.length < 1 ||
+                args.smtpPassword.length > 1024
+              )) {
+                return { error: "SMTP password must be a non-empty string of at most 1024 characters" };
+              }
 
               const identity = findIdentity(args.from);
               if (!identity) {
@@ -7999,10 +8166,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch (error) {
                 return { error: error.message };
               }
-              if ((attachments?.length || 0) > DIRECT_SEND_MAX_ATTACHMENTS) {
-                return { error: `Direct sending allows at most ${DIRECT_SEND_MAX_ATTACHMENTS} inline attachments` };
-              }
-
               const auditId = generateAuthToken().slice(0, 24);
               let auditPath;
               try {
@@ -8034,7 +8197,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 args.from,
                 attachments,
                 true,
-                DIRECT_SEND_AUTHORIZATION
+                DIRECT_SEND_AUTHORIZATION,
+                args.smtpPassword || ""
               );
               let auditWarning;
               try {
@@ -8072,7 +8236,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * 2. Encode non-ASCII as HTML entities - compose window has charset issues
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
-            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, directSendAuthorization) {
+            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, directSendAuthorization, smtpPassword = "") {
               try {
                 const isAuthorizedDirectSend = directSendAuthorization === DIRECT_SEND_AUTHORIZATION;
                 if (skipReview && !isAuthorizedDirectSend && isSkipReviewBlocked()) {
@@ -8116,7 +8280,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 if (skipReview) {
-                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain").then(result => {
+                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain", smtpPassword).then(result => {
                     if (result.success) {
                       let msg = "Message sent";
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
@@ -11034,6 +11198,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 throw new Error(`Tool is not available in the reviewed safe build: ${name}`);
               }
               switch (name) {
+                case "listThunderbirdWindows":
+                  return listThunderbirdWindows();
+                case "closeThunderbirdWindow":
+                  return closeThunderbirdWindow(args.windowId);
+                case "respondToSmtpPrompt":
+                  return respondToSmtpPrompt(args.windowId, args.password, args.rememberPassword ?? false);
                 case "listAccounts":
                   return listAccounts();
                 case "listFolders":

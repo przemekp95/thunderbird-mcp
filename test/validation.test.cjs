@@ -50,7 +50,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
     'this.buildTools = buildTools;',
     'this.validateAgainstSchema = validateAgainstSchema;',
     'this.filePathsToAttachDescs = filePathsToAttachDescs;',
-    'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
+    'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES };',
   ].join('\n'), sandbox);
   return sandbox;
 }
@@ -850,25 +850,20 @@ describe('Validation: attachment sending', () => {
     assert.match(result.failed[0], /garbage\.bin \(invalid base64 data\)/);
   });
 
-  it('production schemas and runtime enforce the per-message attachment count cap', () => {
-    const maxCount = productionAttachmentValidation.attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE;
-    const entries = Array.from({ length: maxCount + 1 }, (_, index) => `/tmp/file-${index}.txt`);
+  it('production schemas and runtime do not impose an attachment count cap', () => {
+    const entries = Array.from({ length: 21 }, (_, index) => `/tmp/file-${index}.txt`);
     for (const [toolName, requiredArgs] of Object.entries(productionToolArgs)) {
       const errors = validateProductionToolArgs(toolName, {
         ...requiredArgs,
         attachments: entries,
       });
-      assert.ok(
-        errors.some(error => error.includes(`at most ${maxCount}`)),
-        `${toolName}: ${errors.join('; ')}`
-      );
+      assert.deepEqual(errors, [], `${toolName}: ${errors.join('; ')}`);
     }
 
     const files = new Map(entries.map(entry => [entry, makeMockLocalFile(entry)]));
     const { result } = convertProductionFileAttachments(entries, files);
-    assert.equal(result.descs.length, maxCount);
-    assert.equal(result.failed.length, 1);
-    assert.match(result.failed[0], new RegExp(`Attachment count ${maxCount + 1} exceeds the ${maxCount} attachment limit`));
+    assert.equal(result.descs.length, entries.length);
+    assert.equal(result.failed.length, 0);
   });
 
   it('production runtime enforces a 50MB aggregate attachment cap', () => {
@@ -1320,6 +1315,21 @@ describe('Validator: sendMailDirect bounds', () => {
 
   it('accepts the bounded direct-send shape', () => {
     assert.deepEqual(validateProductionToolArgs('sendMailDirect', base), []);
+    assert.deepEqual(validateProductionToolArgs('sendMailDirect', {
+      ...base,
+      smtpPassword: 'one-use-password',
+    }), []);
+  });
+
+  it('rejects malformed transient SMTP passwords', () => {
+    assert.ok(validateProductionToolArgs('sendMailDirect', {
+      ...base,
+      smtpPassword: '',
+    }).length > 0);
+    assert.ok(validateProductionToolArgs('sendMailDirect', {
+      ...base,
+      smtpPassword: 'x'.repeat(1025),
+    }).length > 0);
   });
 
   it('rejects skipReview and host-path attachments', () => {
@@ -1337,21 +1347,22 @@ describe('Validator: sendMailDirect bounds', () => {
     );
   });
 
-  it('rejects oversized subject and too many attachments', () => {
+  it('rejects an oversized subject but accepts more than three attachments', () => {
     assert.ok(
       validateProductionToolArgs('sendMailDirect', {
         ...base,
         subject: 'x'.repeat(999),
       }).some(error => /at most 998/.test(error))
     );
-    assert.ok(
+    assert.deepEqual(
       validateProductionToolArgs('sendMailDirect', {
         ...base,
         attachments: Array.from(
           { length: 4 },
           (_, index) => ({ name: `${index}.txt`, base64: 'eA==' })
         ),
-      }).some(error => /at most 3 item/.test(error))
+      }),
+      []
     );
   });
 });

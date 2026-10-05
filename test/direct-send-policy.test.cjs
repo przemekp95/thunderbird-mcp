@@ -99,6 +99,61 @@ this.directSendQuota = { getDirectSendQuotaState, reserveDirectSendQuota };`,
   return { quota: sandbox.directSendQuota, prefs };
 }
 
+function loadNativeSend() {
+  const snippet = getMarkedSnippet(apiSource, "function sendMessageDirectly(", "function escapeHtml(s)");
+  const calls = [];
+  const timer = { initWithCallback() {}, cancel() {} };
+  const sandbox = {
+    Cc: {
+      "@mozilla.org/timer;1": { createInstance: () => timer },
+      "@mozilla.org/messengercompose/send;1": {
+        createInstance: () => ({
+          createAndSendMessage(...args) {
+            calls.push(args);
+            args[12].onStopSending("<test@example.com>", 0);
+          },
+        }),
+      },
+    },
+    Ci: {
+      nsITimer: { TYPE_ONE_SHOT: 0 },
+      nsIMsgCompDeliverMode: { Now: 0 },
+      nsIMsgCompType: { New: 0 },
+    },
+    ChromeUtils: { generateQI: () => () => {} },
+    Components: { isSuccessCode: status => status === 0 },
+    MailServices: { accounts: { accounts: [] } },
+    descsToMsgAttachments: () => [],
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${snippet}\nthis.nativeSend = sendMessageDirectly;`, sandbox);
+  return { nativeSend: sandbox.nativeSend, calls };
+}
+
+function loadDirectSend() {
+  const snippet = getMarkedSnippet(apiSource, "async function sendMailDirect(args)", "function composeMail(");
+  const audit = [];
+  const composeCalls = [];
+  const sandbox = {
+    readDirectSendConfigFromPrefs: () => ({ enabled: true, dailyLimit: 5 }),
+    findIdentity: () => ({ email: "sender@example.com" }),
+    findIdentityAccountKey: () => "account1",
+    getDirectSendQuotaState: () => ({ used: 0 }),
+    evaluateDirectSendRequest: () => ({ recipients: ["recipient@example.com"] }),
+    normalizeSafeInlineAttachments: () => [],
+    generateAuthToken: () => "1234567890abcdef12345678",
+    appendDirectSendAudit: entry => { audit.push(entry); return "/private/audit.jsonl"; },
+    reserveDirectSendQuota: () => ({ used: 1, remaining: 4 }),
+    composeMail: async (...args) => { composeCalls.push(args); return { success: true }; },
+    DIRECT_SEND_MAX_SUBJECT_CHARS: 512,
+    DIRECT_SEND_MAX_BODY_CHARS: 10000,
+    DIRECT_SEND_AUTHORIZATION: Symbol("authorized"),
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${snippet}\nthis.directSend = sendMailDirect;`, sandbox);
+  return { directSend: sandbox.directSend, audit, composeCalls };
+}
+
 describe("direct-send policy", () => {
   it("normalizes exact mailbox and domain allow-rules", () => {
     const { policy } = loadPolicy();
@@ -167,8 +222,8 @@ describe("direct-send policy", () => {
       ).error,
       /account9/
     );
-    assert.match(
-      policy.validateDirectSendSettings(
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(policy.validateDirectSendSettings(
         {
           enabled: true,
           allowedAccountIds: ["account1"],
@@ -177,8 +232,14 @@ describe("direct-send policy", () => {
           dailyLimit: 1,
         },
         ["account1"]
-      ).error,
-      /recipient/i
+      ))),
+      {
+        enabled: true,
+        allowedAccountIds: ["account1"],
+        allowedRecipients: [],
+        maxRecipientsPerMessage: 1,
+        dailyLimit: 1,
+      }
     );
     assert.match(
       policy.validateDirectSendSettings(
@@ -249,6 +310,48 @@ describe("direct-send policy", () => {
     );
   });
 
+  it("allows any syntactically valid recipient when no optional recipient rules are configured", () => {
+    const { policy } = loadPolicy();
+    const config = {
+      enabled: true,
+      allowedAccountIds: ["account1"],
+      allowedRecipients: [],
+      maxRecipientsPerMessage: 2,
+      dailyLimit: 5,
+    };
+
+    const result = policy.evaluateDirectSendRequest(
+      config,
+      {
+        accountId: "account1",
+        to: "first@example.net",
+        cc: "second@example.org",
+        bcc: "",
+      },
+      0
+    );
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(Array.from(result.recipients), [
+      "first@example.net",
+      "second@example.org",
+    ]);
+    assert.match(
+      policy.evaluateDirectSendRequest(config, {
+        accountId: "account1",
+        to: "first@example.net, second@example.org, third@example.com",
+      }, 0).error,
+      /at most 2/i
+    );
+    assert.match(
+      policy.evaluateDirectSendRequest(config, {
+        accountId: "account1",
+        to: "ok@example.net\r\nBcc: attacker@example.com",
+      }, 0).error,
+      /control|header/i
+    );
+  });
+
   it("reads missing or corrupt preferences as disabled", () => {
     const { policy } = loadPolicy();
     assert.equal(policy.readDirectSendConfigFromPrefs().enabled, false);
@@ -306,6 +409,35 @@ describe("direct-send policy", () => {
 });
 
 describe("direct-send integration contract", () => {
+  it("routes an optional SMTP password only to compose, never to the audit or result", async () => {
+    const { directSend, audit, composeCalls } = loadDirectSend();
+    const secret = "temporary-smtp-secret";
+    const result = await directSend({
+      from: "sender@example.com", to: "recipient@example.com",
+      subject: "Hello", body: "Test body", smtpPassword: secret,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(composeCalls[0].at(-1), secret);
+    assert.doesNotMatch(JSON.stringify(audit), /temporary-smtp-secret/);
+    assert.doesNotMatch(JSON.stringify(result), /temporary-smtp-secret/);
+  });
+
+  it("passes a transient SMTP password to Thunderbird's native send without returning it", async () => {
+    const { nativeSend, calls } = loadNativeSend();
+    const secret = "temporary-smtp-secret";
+    const result = await nativeSend(
+      { body: "Test body", addAttachment() {} },
+      { email: "sender@example.com", key: "identity1" },
+      [], null, 0, 0, "text/plain", secret
+    );
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][13], secret);
+    assert.equal(result.success, true);
+    assert.doesNotMatch(JSON.stringify(result), /temporary-smtp-secret/);
+  });
+
   it("exposes a dedicated direct tool without weakening reviewed sendMail", () => {
     assert.match(apiSource, /"sendMailDirect"/);
     assert.match(apiSource, /case "sendMailDirect":/);

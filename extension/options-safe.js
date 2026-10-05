@@ -196,8 +196,10 @@ async function loadDirectSend() {
     }
     if (config.error || config.quotaError) {
       setDirectSendStatus(config.error || config.quotaError, true);
-    } else if (config.enabled) {
+    } else if (config.enabled && (config.allowedRecipients || []).length > 0) {
       setDirectSendStatus("Enabled for the checked accounts and listed recipients.");
+    } else if (config.enabled) {
+      setDirectSendStatus("Enabled for the checked accounts and any valid recipient.");
     } else {
       setDirectSendStatus("Disabled. The direct-send MCP tool is hidden.");
     }

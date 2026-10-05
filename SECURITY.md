@@ -4,8 +4,9 @@
 
 Umożliwić lokalnemu klientowi MCP kontrolowaną pracę z pocztą i kontaktami
 z jawnie wskazanych kont i książek adresowych. Automatyczna wysyłka jest
-osobną, domyślnie wyłączoną zdolnością z dodatkowymi allowlistami, limitami i
-audytem; permanentne kasowanie i odczyt dowolnych plików systemowych pozostają
+osobną, domyślnie wyłączoną zdolnością z allowlistą kont, opcjonalnymi
+ograniczeniami odbiorców, limitami i audytem; permanentne kasowanie i odczyt
+dowolnych plików systemowych pozostają
 niedostępne.
 
 ## Aktywa
@@ -19,6 +20,7 @@ niedostępne.
 - pliki użytkownika poza profilem pocztowym.
 - prywatny dziennik zaakceptowanych prób automatycznej wysyłki.
 - trwałe definicje filtrów, ich kopie bezpieczeństwa i dziennik mutacji.
+- opcjonalne, przekazane na czas jednej wysyłki hasło SMTP.
 
 ## Granice zaufania
 
@@ -73,11 +75,22 @@ traktowana jako instrukcja ani konfiguracja.
 12. Fork nie ma `update_url`, generatora aktualizacji ani workflow publikacji.
 13. `sendMail`, odpowiedź i przekazanie zawsze otwierają okno podglądu.
     Osobne `sendMailDirect` jest ukryte i blokowane, dopóki lokalna konfiguracja
-    nie zawiera jawnego włączenia, kont nadawczych, reguł odbiorców oraz limitów.
-    Narzędzie wymaga jawnej tożsamości nadawcy, sprawdza wszystkich odbiorców
-    `to`/`cc`/`bcc`, odrzuca globalny wildcard, rezerwuje dzienny limit przed
-    transportem i przyjmuje najwyżej trzy załączniki inline. Zwykły
-    `sendMail` nie dziedziczy tej zdolności.
+    nie zawiera jawnego włączenia, kont nadawczych oraz limitów. Narzędzie wymaga
+    jawnej tożsamości nadawcy, waliduje wszystkich odbiorców `to`/`cc`/`bcc`,
+    egzekwuje opcjonalną listę ograniczeń odbiorców, rezerwuje dzienny limit
+    przed transportem i nie ogranicza liczby załączników inline. Zwykły
+    `sendMail` nie dziedziczy tej zdolności. Opcjonalne `smtpPassword` jest
+    przekazywane wyłącznie do natywnej funkcji wysyłania, bez zapisu w
+    preferencjach i dzienniku dodatku; historia wywołań po stronie klienta MCP
+    pozostaje osobną granicą zaufania.
+    `listThunderbirdWindows` nie zwraca wartości pól haseł. Osobne
+    `closeThunderbirdWindow` może zamknąć wyłącznie wskazany żywy podgląd
+    `mail:messageWindow` z natywnego `messageWindow.xhtml`. Nie zamyka
+    okien głównych, edytorów ani dialogów i sprawdza faktyczne zamknięcie.
+    `respondToSmtpPrompt` przyjmuje hasło tylko dla żywego okna
+    `commonDialog.xhtml` typu `promptPassword`, którego tytuł zawiera `SMTP`
+    oraz nazwę skonfigurowanego serwera. Nie daje ogólnego klikania w oknach;
+    użyte hasło może być widoczne w historii klienta MCP.
 14. Każda zaakceptowana próba `sendMailDirect` jest przed transportem zapisywana
     w prywatnym pliku `direct-send-audit.jsonl`; wpis zawiera identyfikator,
     konto, odbiorców, rozmiary pól i liczbę załączników, ale nie temat ani treść.
@@ -146,8 +159,9 @@ traktowana jako instrukcja ani konfiguracja.
   przypięty do jednego pliku nie przełącza się na drugi;
 - `sendMail`, odpowiedź i przekazanie otwierają okno podglądu;
 - przy wyłączonej polityce `sendMailDirect` nie występuje w `tools/list`;
-- błędna polityka, niedozwolone konto lub odbiorca, przekroczony limit albo
-  niedostępny dziennik blokują `sendMailDirect` przed transportem;
+- błędna polityka, niedozwolone konto, odbiorca wykluczony przez skonfigurowane
+  ograniczenia, przekroczony limit albo niedostępny dziennik blokują
+  `sendMailDirect` przed transportem;
 - `deleteMessages` i `deleteFolder` przenoszą wyłącznie do Kosza, a próba
   działania wewnątrz Kosza jest odrzucana;
 - `createFolder` na testowym IMAP zwraca niepusty, zweryfikowany URI dopiero po
