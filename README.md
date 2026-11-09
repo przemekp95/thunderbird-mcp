@@ -9,14 +9,47 @@ Repo powstało z commita upstream:
 Fork ma własny identyfikator dodatku, katalog połączenia i preferencje. Push do
 zdalnego upstreamu jest lokalnie wyłączony.
 
+## Code review guide: fork safety extensions
+
+This branch publishes a focused subset of local work by Przemysław Pietrzak on
+Tomasz Kasperczyk's upstream server. It is not an independently authored MCP
+server. The original upstream license and attribution are retained.
+
+- [Compose review and send controls](extension/mcp_server/api.js): look for
+  `BEGIN COMPOSE WINDOW CONTROLS` and the three tool definitions/dispatcher cases.
+- [Compose regression tests](test/compose-send.test.cjs): genuine revision reuse
+  after body, recipient, identity or attachment-metadata edits is refused before
+  authorization or transport. An asynchronous pre-send edit is also refused.
+- [Sender, recipient, quota and audit policy tests](test/direct-send-policy.test.cjs)
+  and [default-deny/untrusted-output tests](test/safe-readonly.test.cjs).
+- Run `./.codex/verify` for the full automated gate. Tests use synthetic fixtures;
+  they do not send real email or establish live Thunderbird compatibility.
+
+`getComposeWindow` reads a selected editor and returns a revision.
+`sendComposeWindow` requires that revision, `confirmSend: true`, an explicitly
+configured direct-send policy, an allowed account and recipient/quota checks.
+It rechecks the revision immediately before native delivery and blocks duplicate
+attempts. A native completion state is not proof that a recipient received mail.
+The MCP client must obtain actual human approval; a boolean alone cannot prove it.
+
+Review boundaries: body output may be truncated and attachment lists may be
+incomplete; inspect the native editor before approval in those cases. The revision
+covers full text/HTML, selected headers, sender identity and attachment metadata
+including URLs. It does **not** hash attachment file bytes or every MIME header.
+This is a local integration with automated regression evidence, not a claim of
+production certification or a live hosted demo. This publication does not install
+or enable sending in any user profile.
+
 ## Co jest dostępne
 
-MCP domyślnie publikuje dokładnie 30 narzędzi. Po osobnym lokalnym włączeniu
-`sendMailDirect` liczba rośnie do 31:
+MCP domyślnie publikuje dokładnie 32 narzędzia. Po osobnym lokalnym włączeniu
+polityki wysyłania dostępne są też `sendMailDirect` i `sendComposeWindow`
+(łącznie 34):
 
 - odczyt: `listAccounts`, `listFolders`, `searchMessages`,
   `getRecentMessages`, `getMessage`, `getMessages`, `displayMessage`,
   `getAccountAccess`;
+- przegląd edytora i statusu próby: `getComposeWindow`, `getComposeSendStatus`;
 - tworzenie wiadomości: `sendMail`, `saveDraft`, `replyToMessage`,
   `forwardMessage`; po osobnym lokalnym włączeniu także `sendMailDirect`;
 - organizacja: `updateMessage`, `deleteMessages`, `createFolder`,

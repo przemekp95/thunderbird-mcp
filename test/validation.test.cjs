@@ -1542,3 +1542,19 @@ describe('isSensitiveFilePath: case insensitivity and slash normalization', () =
     assert.equal(isSensitiveFilePath('C:\\Users\\x\\.ssh\\id_rsa'), true);
   });
 });
+
+
+describe('Validator: reviewed compose sending', () => {
+  const valid = { windowId: 'window-1', expectedRevision: 'a'.repeat(64), confirmSend: true };
+  it('accepts an explicit confirmation bound to a SHA-256 revision', () => {
+    assert.deepEqual(validateProductionToolArgs('sendComposeWindow', valid), []);
+  });
+  it('rejects absent approval, invalid revisions and unknown arguments', () => {
+    for (const args of [
+      { ...valid, confirmSend: false },
+      { windowId: valid.windowId, expectedRevision: valid.expectedRevision },
+      { ...valid, expectedRevision: 'stale' },
+      { ...valid, skipReview: true },
+    ]) assert.ok(validateProductionToolArgs('sendComposeWindow', args).length > 0);
+  });
+});

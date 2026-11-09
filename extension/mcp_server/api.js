@@ -1741,6 +1741,9 @@ const SAFE_TOOL_NAMES = new Set([
   "getMessages",
   "displayMessage",
   "listThunderbirdWindows",
+  "getComposeWindow",
+  "sendComposeWindow",
+  "getComposeSendStatus",
   "closeThunderbirdWindow",
   "respondToSmtpPrompt",
   "sendMail",
@@ -2498,6 +2501,145 @@ function respondToSmtpPrompt(windowId, password, rememberPassword = false) {
 }
 // END THUNDERBIRD WINDOW CONTROLS
 
+// BEGIN COMPOSE WINDOW CONTROLS
+// Operate on an explicitly observed editor, never a most-recent window. Access
+// and hashing are supplied by the server's existing account policy helpers.
+const composeWindowOperations = new WeakSet();
+function selectedComposeWindow(windowId, access, ownOperation = false, allowSaving = false) {
+  const row = currentThunderbirdWindows().find(entry => entry.windowId === windowId);
+  const win = thunderbirdWindowsById.get(windowId);
+  if (!row || row.kind !== "compose" ||
+      win.document.documentURI !== "chrome://messenger/content/messengercompose/messengercompose.xhtml" ||
+      !win.gMsgCompose || !win.gCurrentIdentity ||
+      typeof win.GetComposeDetails !== "function" || typeof win.GetCurrentEditor !== "function") {
+    throw new Error("Selected window is not a ready, live compose editor");
+  }
+  if (!access.canAccess(win.gCurrentIdentity)) throw new Error("Compose account is restricted");
+  if (win.gSendOperationInProgress || (!allowSaving && (win.gSaveOperationInProgress || win.gAutoSavingInProgress || win.gWindowLocked)) ||
+      (!ownOperation && composeWindowOperations.has(win))) {
+    throw new Error("Compose editor is busy; try again after its operation completes");
+  }
+  return win;
+}
+
+function composeWindowSnapshot(win, access) {
+  const fields = win.GetComposeDetails();
+  const editor = win.GetCurrentEditor();
+  if (!editor) throw new Error("Compose editor is not ready");
+  const body = editor.outputToString("text/plain", Ci.nsIDocumentEncoder.OutputRaw);
+  const html = editor.outputToString("text/html", Ci.nsIDocumentEncoder.OutputRaw);
+  const attachments = Array.from(fields.attachments || []);
+  const headers = {};
+  for (const key of ["from", "to", "cc", "bcc", "subject"]) headers[key] = String(fields[key] || "");
+  const revision = access.hash(JSON.stringify({
+    identity: win.gCurrentIdentity.key, headers, body, html,
+    attachments: attachments.map(a => [a.name, a.size, a.contentType, a.url]),
+  }));
+  return {
+    ...Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, sanitizeUntrustedText(value, SAFE_HEADER_MAX_CHARS)])),
+    body: sanitizeUntrustedText(body, SAFE_MESSAGE_BODY_MAX_CHARS),
+    bodyComplete: body.length <= SAFE_MESSAGE_BODY_MAX_CHARS,
+    isHtml: !!win.IsHTMLEditor(),
+    imageCount: (html.match(/<img\b/gi) || []).length,
+    signatureCount: (html.match(/class\s*=\s*["'][^"']*\bmoz-signature\b/gi) || []).length,
+    attachments: attachments.slice(0, 50).map((a, index) => ({
+      index,
+      name: sanitizeUntrustedText(a.name, 255), size: Number(a.size) || 0,
+      contentType: sanitizeUntrustedText(a.contentType, 100),
+    })),
+    attachmentsOmitted: Math.max(0, attachments.length - 50),
+    modified: !!(win.gContentChanged || win.gMsgCompose.bodyModified || win.gReceiptOptionChanged || win.gDSNOptionChanged),
+    draftId: sanitizeUntrustedText(fields.draftId, SAFE_HEADER_MAX_CHARS),
+    revision,
+  };
+}
+
+function getComposeWindow(windowId, access, focus = false) {
+  try {
+    const win = selectedComposeWindow(windowId, access);
+    const snapshot = composeWindowSnapshot(win, access);
+    if (focus) win.focus();
+    return { success: true, windowId, security: safeSecurityNotice(), compose: snapshot };
+  } catch {
+    return { success: false, error: "Selected compose editor is unavailable, busy or restricted" };
+  }
+}
+
+function composeOwnedPrompts(win) {
+  return currentThunderbirdWindows().filter(row => {
+    const prompt = thunderbirdWindowsById.get(row.windowId);
+    return prompt !== win && (prompt.opener === win || prompt.args?.owningBrowsingContext?.topChromeWindow === win);
+  }).map(row => ({ row, win: thunderbirdWindowsById.get(row.windowId) }));
+}
+
+// Attempts are retained after window closure: a completed or uncertain attempt
+// must never become permission to send the same editor again.
+const composeSendAttempts = new Map();
+function getComposeSendStatus(windowId, access) {
+  const attempt = composeSendAttempts.get(windowId);
+  if (!attempt || !access.canAccess(attempt.identity)) return { success: false, error: "No accessible send attempt for this window" };
+  return { success: true, windowId, state: attempt.state, auditId: attempt.auditId,
+    message: "Confirm the matching Sent copy before reporting delivery; never retry a pending or uncertain attempt" };
+}
+
+function sendComposeWindow(windowId, expectedRevision, confirmSend, access) {
+  let win;
+  try {
+    if (confirmSend !== true) return { success: false, error: "Explicit authorization for this reviewed message is required" };
+    if (composeSendAttempts.has(windowId)) return { success: false, error: "This editor already has a send attempt; inspect its status and Sent folder, do not retry" };
+    win = selectedComposeWindow(windowId, access);
+    if (composeOwnedPrompts(win).length) return { success: false, error: "Resolve the selected editor's existing dialog before sending" };
+    const before = composeWindowSnapshot(win, access);
+    if (before.revision !== expectedRevision) return { success: false, error: "Compose revision changed; read the editor again" };
+    if (typeof win.GenericSendMessage !== "function" || typeof win.DoSpellCheckBeforeSend !== "function") return { success: false, error: "Native compose sending is unavailable" };
+    const authorization = access.authorizeSend(win.GetComposeDetails(), win.gCurrentIdentity);
+    if (authorization.error) return { success: false, error: authorization.error };
+    const attempt = { state: "pending", identity: win.gCurrentIdentity, auditId: authorization.auditId };
+    composeSendAttempts.set(windowId, attempt);
+    composeWindowOperations.add(win);
+    const originalSpellCheck = win.DoSpellCheckBeforeSend;
+    const compose = win.gMsgCompose;
+    const listener = {
+      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+      NotifyComposeFieldsReady() {}, NotifyComposeBodyReady() {}, SaveInFolderDone() {},
+      ComposeProcessDone(status) { attempt.state = Components.isSuccessCode(status) ? "sent" : "failed"; },
+    };
+    const verifyBeforeDelivery = event => {
+      try {
+        if (!access.canAccess(win.gCurrentIdentity) || composeWindowSnapshot(win, access).revision !== expectedRevision) {
+          event.preventDefault(); attempt.state = "failed";
+        }
+      } catch { event.preventDefault(); attempt.state = "failed"; }
+    };
+    const finish = () => {
+      win.removeEventListener("compose-send-message", verifyBeforeDelivery);
+      if (attempt.state === "pending") attempt.state = "unconfirmed";
+      win.DoSpellCheckBeforeSend = originalSpellCheck;
+      try { compose.UnregisterStateListener(listener); } catch {}
+      composeWindowOperations.delete(win);
+      try { access.auditSendResult(attempt); } catch { attempt.auditWarning = true; }
+    };
+    // The caller explicitly approved the exact reviewed text. Suppress only this
+    // editor's interactive spellcheck, never global preferences or other checks.
+    win.DoSpellCheckBeforeSend = () => false;
+    try {
+      compose.RegisterStateListener(listener);
+      win.addEventListener("compose-send-message", verifyBeforeDelivery);
+      Promise.resolve(win.GenericSendMessage(Ci.nsIMsgCompDeliverMode.Now)).then(finish).catch(() => {
+        if (attempt.state === "pending") attempt.state = "unconfirmed";
+        finish();
+      });
+    } catch {
+      attempt.state = "unconfirmed";
+      finish();
+    }
+    return getComposeSendStatus(windowId, access);
+  } catch {
+    return { success: false, error: "Could not authorize the selected editor; inspect its send status before retrying" };
+  }
+}
+// END COMPOSE WINDOW CONTROLS
+
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
     const extensionRoot = context.extension.rootURI;
@@ -2569,6 +2711,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         birthday: { type: "string", description: "Birthday as YYYY-MM-DD or --MM-DD when the year is unknown" },
       };
       return [
+      {
+        name: "getComposeWindow", group: "messages", crud: "read",
+        title: "Read Existing Compose Editor",
+        description: "Read one selected live compose editor from listThunderbirdWindows. Returns bounded untrusted text, sender, recipients, subject, revision and attachment metadata only; no image or file payloads. Optional focus shows that existing editor for review.",
+        inputSchema: { type: "object", properties: { windowId: { type: "string", minLength: 1, maxLength: 64 }, focus: { type: "boolean" } }, required: ["windowId"], additionalProperties: false },
+      },
+      {
+        name: "sendComposeWindow", group: "messages", crud: "create",
+        title: "Send Reviewed Compose Editor",
+        description: "Send exactly one freshly reviewed existing editor after explicit user authorization. Preserves native reply threading and attachments. Requires existing direct-send account/recipient policy, quota and audit. Suppresses only that editor's interactive spellcheck. Returns an attempt state, not delivery proof; use getComposeSendStatus and verify Sent. Never retry pending or uncertain attempts.",
+        inputSchema: { type: "object", properties: { windowId: { type: "string", minLength: 1, maxLength: 64 }, expectedRevision: { type: "string", minLength: 64, maxLength: 64, pattern: "^[0-9a-f]{64}$" }, confirmSend: { type: "boolean", enum: [true] } }, required: ["windowId", "expectedRevision", "confirmSend"], additionalProperties: false },
+      },
+      {
+        name: "getComposeSendStatus", group: "messages", crud: "read",
+        title: "Read Compose Send Attempt",
+        description: "Read the selected send attempt even after editor closure. States pending, sent (native success), failed and unconfirmed are distinct. Verify the matching Sent message; do not retry pending or uncertain delivery.",
+        inputSchema: { type: "object", properties: { windowId: { type: "string", minLength: 1, maxLength: 64 } }, required: ["windowId"], additionalProperties: false },
+      },
       {
         name: "listThunderbirdWindows",
         group: "system", crud: "read",
@@ -3901,7 +4061,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function isToolEnabled(toolName) {
               if (!SAFE_TOOL_NAMES.has(toolName)) return false;
-              if (toolName === "sendMailDirect") {
+              if (["sendMailDirect", "sendComposeWindow"].includes(toolName)) {
                 const directSendConfig = readDirectSendConfigFromPrefs();
                 if (!directSendConfig.enabled || directSendConfig.error) return false;
               }
@@ -11198,6 +11358,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 throw new Error(`Tool is not available in the reviewed safe build: ${name}`);
               }
               switch (name) {
+                case "getComposeWindow":
+                  return getComposeWindow(args.windowId, { canAccess: identity => isAccountAllowed(findIdentityAccountKey(identity)), hash: safeFilterSha256 }, args.focus ?? false);
+                case "getComposeSendStatus":
+                  return getComposeSendStatus(args.windowId, { canAccess: identity => isAccountAllowed(findIdentityAccountKey(identity)) });
+                case "sendComposeWindow": {
+                  const access = {
+                    canAccess: identity => isAccountAllowed(findIdentityAccountKey(identity)), hash: safeFilterSha256,
+                    authorizeSend(fields, identity) {
+                      const config = readDirectSendConfigFromPrefs();
+                      if (!config.enabled || config.error) return { error: config.error || "Direct sending is disabled" };
+                      const accountId = findIdentityAccountKey(identity);
+                      const quotaBefore = getDirectSendQuotaState();
+                      if (quotaBefore.error) return quotaBefore;
+                      const policy = evaluateDirectSendRequest(config, { accountId, to: fields.to, cc: fields.cc, bcc: fields.bcc }, quotaBefore.used);
+                      if (policy.error) return policy;
+                      const auditId = generateAuthToken().slice(0, 24);
+                      appendDirectSendAudit({ timestamp: new Date().toISOString(), auditId, phase: "authorized", operation: name, windowId: args.windowId, accountId, recipients: policy.recipients });
+                      const quota = reserveDirectSendQuota(config);
+                      return quota.error ? quota : { auditId };
+                    },
+                    auditSendResult(attempt) {
+                      appendDirectSendAudit({ timestamp: new Date().toISOString(), auditId: attempt.auditId, phase: "result", operation: name, state: attempt.state });
+                    },
+                  };
+                  return sendComposeWindow(args.windowId, args.expectedRevision, args.confirmSend, access);
+                }
                 case "listThunderbirdWindows":
                   return listThunderbirdWindows();
                 case "closeThunderbirdWindow":

@@ -1,6 +1,6 @@
 {
   "name": "thunderbird-mcp-safe",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "private": true,
   "description": "Hardened local MCP bridge for selected Thunderbird mail accounts and address books",
   "author": "Tomasz Kasperczyk; local hardening fork",
