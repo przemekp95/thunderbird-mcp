@@ -6,13 +6,10 @@ const path = require('path');
 
 const {
   advanceToNextCandidate,
-  attachmentLimits,
   buildConnectionDiscoveryErrorMessage,
   compactToolResultJsonText,
   clearConnectionCache,
   discoverConnectionInfo,
-  inlineAttachmentPaths,
-  isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
@@ -25,9 +22,12 @@ function cleanupTempRoot(root) {
   fs.rmSync(root, { recursive: true, force: true });
 }
 
-function writeConnectionFile(filePath, { port, token, pid = process.pid }) {
+function writeConnectionFile(
+  filePath,
+  { port, token, pid = process.pid, profileId = '0'.repeat(32) }
+) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify({ port, token, pid }), 'utf8');
+  fs.writeFileSync(filePath, JSON.stringify({ port, token, pid, profileId }), 'utf8');
 }
 
 function makeTestOptions(root, overrides = {}) {
@@ -41,6 +41,7 @@ function makeTestOptions(root, overrides = {}) {
   fs.mkdirSync(runtimeDir, { recursive: true });
 
   return {
+    allowAutodiscovery: true,
     env: overrides.env || {},
     fsImpl: overrides.fsImpl || fs,
     homeDir,
@@ -156,131 +157,6 @@ describe('Tool result serialization', () => {
   });
 });
 
-describe('Bridge attachment path policy', () => {
-  let root;
-
-  beforeEach(() => {
-    root = makeTempRoot();
-  });
-
-  afterEach(() => {
-    cleanupTempRoot(root);
-  });
-
-  it('rejects sensitive paths before trying to inline them', async () => {
-    const sensitivePath = path.join(root, '.ssh', 'id_rsa');
-    const args = { attachments: [sensitivePath] };
-
-    await assert.rejects(
-      inlineAttachmentPaths(args),
-      error => {
-        assert.match(error.message, /Sensitive attachment path blocked/);
-        assert.ok(error.message.includes(sensitivePath), error.message);
-        return true;
-      }
-    );
-    assert.deepEqual(args.attachments, [sensitivePath]);
-  });
-
-  it('uses the same normalized deny-list rules for Windows paths', () => {
-    assert.equal(isSensitiveFilePath('C:\\Users\\alice\\.ssh\\id_ed25519'), true);
-    assert.equal(isSensitiveFilePath('C:\\Users\\alice\\Downloads\\report.pdf'), false);
-  });
-
-  it('rejects attachment counts above the extension limit before filesystem access', async () => {
-    const attachments = Array.from(
-      { length: attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE + 1 },
-      (_, index) => ({ name: `inline-${index}.txt`, base64: 'QQ==' })
-    );
-
-    await assert.rejects(
-      inlineAttachmentPaths({ attachments }),
-      new RegExp(
-        `Attachment count ${attachments.length} exceeds the ` +
-        `${attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`
-      )
-    );
-  });
-
-  it('rejects an aggregate of path attachments above 50 MB before reading', async () => {
-    const sizes = [18, 18, 15].map(mib => mib * 1024 * 1024);
-    const attachments = sizes.map((size, index) => {
-      const filePath = path.join(root, `aggregate-${index}.bin`);
-      fs.writeFileSync(filePath, '');
-      fs.truncateSync(filePath, size);
-      return filePath;
-    });
-    const args = { attachments };
-
-    await assert.rejects(
-      inlineAttachmentPaths(args),
-      error => {
-        assert.match(error.message, /50 MB aggregate attachment limit/);
-        assert.ok(error.message.includes(attachments[2]), error.message);
-        return true;
-      }
-    );
-    assert.deepEqual(args.attachments, attachments);
-  });
-
-  it('rejects oversized and non-regular files during preflight', async () => {
-    const oversizedPath = path.join(root, 'oversized.bin');
-    fs.writeFileSync(oversizedPath, '');
-    fs.truncateSync(oversizedPath, attachmentLimits.MAX_ATTACHMENT_BYTES + 1);
-
-    await assert.rejects(
-      inlineAttachmentPaths({ attachments: [oversizedPath] }),
-      error => error.message.includes(`Attachment too large: ${oversizedPath}`)
-    );
-    await assert.rejects(
-      inlineAttachmentPaths({ attachments: [root] }),
-      error => error.message.includes(`Attachment is not a regular file: ${root}`)
-    );
-  });
-
-  it('rejects symlinked attachment paths', async (t) => {
-    const targetPath = path.join(root, 'target.txt');
-    const symlinkPath = path.join(root, 'attachment.txt');
-    fs.writeFileSync(targetPath, 'safe attachment', 'utf8');
-    try {
-      fs.symlinkSync(targetPath, symlinkPath, 'file');
-    } catch (error) {
-      if (error.code === 'EPERM' || error.code === 'EACCES') {
-        t.skip(`symlinks unavailable: ${error.code}`);
-        return;
-      }
-      throw error;
-    }
-
-    await assert.rejects(
-      inlineAttachmentPaths({ attachments: [symlinkPath] }),
-      error => {
-        assert.match(error.message, /symlink/);
-        assert.ok(error.message.includes(symlinkPath), error.message);
-        return true;
-      }
-    );
-  });
-
-  it('inlines allowed files and leaves inline objects untouched', async () => {
-    const filePath = path.join(root, 'report.txt');
-    const inline = { name: 'already-inline.txt', base64: 'QQ==' };
-    fs.writeFileSync(filePath, 'hello', 'utf8');
-    const args = { attachments: [filePath, inline] };
-
-    await inlineAttachmentPaths(args);
-
-    assert.deepEqual(args.attachments, [
-      {
-        name: 'report.txt',
-        contentType: 'text/plain',
-        base64: Buffer.from('hello').toString('base64'),
-      },
-      inline,
-    ]);
-  });
-});
-
 describe('Bridge discovery', () => {
   let root;
 
@@ -299,7 +175,7 @@ describe('Bridge discovery', () => {
       env: { THUNDERBIRD_MCP_CONNECTION_FILE: path.join(root, 'env', 'connection.json') },
     });
 
-    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp-safe', 'connection.json'), {
       port: 20001,
       token: 'native-token',
     });
@@ -313,6 +189,7 @@ describe('Bridge discovery', () => {
       port: 20002,
       token: 'env-token',
       pid: process.pid,
+      profileId: '0'.repeat(32),
     });
   });
 
@@ -337,7 +214,7 @@ describe('Bridge discovery', () => {
       'utf8'
     );
 
-    writeConnectionFile(path.join(snapTmpDir, 'thunderbird-mcp', 'connection.json'), {
+    writeConnectionFile(path.join(snapTmpDir, 'thunderbird-mcp-safe', 'connection.json'), {
       port: 20003,
       token: 'snap-token',
     });
@@ -371,7 +248,7 @@ describe('Bridge discovery', () => {
       'utf8'
     );
     // If the decoy was picked up, the bridge would read this file and succeed.
-    writeConnectionFile(path.join(decoyTmpDir, 'thunderbird-mcp', 'connection.json'), {
+    writeConnectionFile(path.join(decoyTmpDir, 'thunderbird-mcp-safe', 'connection.json'), {
       port: 29999,
       token: 'attacker-token',
     });
@@ -392,7 +269,7 @@ describe('Bridge discovery', () => {
       options.runtimeDir,
       'app',
       'eu.betterbird.Betterbird',
-      'thunderbird-mcp',
+      'thunderbird-mcp-safe',
       'connection.json'
     );
     writeConnectionFile(flatpakConnFile, {
@@ -418,8 +295,8 @@ describe('Bridge discovery', () => {
       uid: currentUid,
     });
 
-    const ownedConnFile = path.join(darwinRoot, 'aa', 'bb', 'T', 'thunderbird-mcp', 'connection.json');
-    const foreignConnFile = path.join(darwinRoot, 'cc', 'dd', 'T', 'thunderbird-mcp', 'connection.json');
+    const ownedConnFile = path.join(darwinRoot, 'aa', 'bb', 'T', 'thunderbird-mcp-safe', 'connection.json');
+    const foreignConnFile = path.join(darwinRoot, 'cc', 'dd', 'T', 'thunderbird-mcp-safe', 'connection.json');
 
     writeConnectionFile(ownedConnFile, {
       port: 20005,
@@ -458,7 +335,7 @@ describe('Bridge discovery', () => {
       options.runtimeDir,
       'app',
       'org.mozilla.thunderbird',
-      'thunderbird-mcp',
+      'thunderbird-mcp-safe',
       'connection.json'
     );
     writeConnectionFile(delayedConnFile, {
@@ -482,6 +359,59 @@ describe('Bridge discovery', () => {
     assert.match(buildConnectionDiscoveryErrorMessage(), /file not found/);
   });
 
+  it('rejects a pinned stale connection file whose Thunderbird process is gone', () => {
+    const connectionFile = path.join(root, 'pinned-stale', 'connection.json');
+    const options = makeTestOptions(root, {
+      env: { THUNDERBIRD_MCP_CONNECTION_FILE: connectionFile },
+      processImpl: {
+        env: { THUNDERBIRD_MCP_CONNECTION_FILE: connectionFile },
+        platform: 'linux',
+        kill(pid, signal) {
+          assert.equal(pid, 424242);
+          assert.equal(signal, 0);
+          const error = new Error('No such process');
+          error.code = 'ESRCH';
+          throw error;
+        },
+      },
+    });
+    writeConnectionFile(connectionFile, {
+      port: 8765,
+      token: 'a'.repeat(64),
+      pid: 424242,
+    });
+
+    const result = discoverConnectionInfo(options);
+
+    assert.equal(result.candidates.length, 0);
+    assert.match(result.attempts.at(-1).reason, /process 424242 is not running/i);
+  });
+
+  it('accepts a pinned connection file while its recorded process is alive', () => {
+    const connectionFile = path.join(root, 'pinned-live', 'connection.json');
+    const options = makeTestOptions(root, {
+      env: { THUNDERBIRD_MCP_CONNECTION_FILE: connectionFile },
+      processImpl: {
+        env: { THUNDERBIRD_MCP_CONNECTION_FILE: connectionFile },
+        platform: 'linux',
+        kill(pid, signal) {
+          assert.equal(pid, 434343);
+          assert.equal(signal, 0);
+        },
+      },
+    });
+    writeConnectionFile(connectionFile, {
+      port: 8765,
+      token: 'b'.repeat(64),
+      pid: 434343,
+    });
+
+    const result = discoverConnectionInfo(options);
+
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.attempts.at(-1).reason, 'ok');
+  });
+
   it('discoverConnectionInfo collects every valid candidate, not just the winner', () => {
     const options = makeTestOptions(root, {
       platform: 'linux',
@@ -489,14 +419,14 @@ describe('Bridge discovery', () => {
     });
 
     // Native /tmp file (first group, winner)
-    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp-safe', 'connection.json'), {
       port: 20100,
       token: 'native',
     });
 
     // Flatpak runtime file (later group, also valid)
     writeConnectionFile(
-      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json'),
+      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp-safe', 'connection.json'),
       { port: 20101, token: 'flatpak' }
     );
 
@@ -512,12 +442,12 @@ describe('Bridge discovery', () => {
       runtimeDir: path.join(root, 'runtime'),
     });
 
-    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp-safe', 'connection.json'), {
       port: 20200,
       token: 'first',
     });
     writeConnectionFile(
-      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json'),
+      path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp-safe', 'connection.json'),
       { port: 20201, token: 'second' }
     );
 
@@ -548,7 +478,7 @@ describe('Bridge discovery', () => {
       port: 20300,
       token: 'pinned',
     });
-    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'), {
+    writeConnectionFile(path.join(root, 'tmp', 'thunderbird-mcp-safe', 'connection.json'), {
       port: 20301,
       token: 'should-not-appear',
     });

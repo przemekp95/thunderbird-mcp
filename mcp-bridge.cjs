@@ -19,9 +19,10 @@ const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
 
 const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
-const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
+const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp-safe';
 const CONNECTION_FILE_BASENAME = 'connection.json';
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+const SAFE_PROFILE_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 // MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
 // server MUST respond with the requested version if it supports it, otherwise
@@ -44,7 +45,7 @@ const BRIDGE_VERSION = (() => {
   }
 })();
 const SERVER_INFO = Object.freeze({
-  name: 'thunderbird-mcp',
+  name: 'thunderbird-mcp-safe',
   version: BRIDGE_VERSION,
 });
 
@@ -52,7 +53,7 @@ const DEBUG = !!process.env.THUNDERBIRD_MCP_DEBUG;
 
 function debugLog(message) {
   if (DEBUG) {
-    process.stderr.write('[thunderbird-mcp] ' + message + '\n');
+    process.stderr.write('[thunderbird-mcp-safe] ' + message + '\n');
   }
 }
 
@@ -401,10 +402,9 @@ function findFlatpakConnectionCandidates(context) {
 
 function buildCandidateGroups(options = {}) {
   const context = createDiscoveryContext(options);
-  const groups = [];
 
   if (context.env.THUNDERBIRD_MCP_CONNECTION_FILE) {
-    groups.push({
+    return [{
       notes: [],
       candidates: [
         makeCandidate(
@@ -414,27 +414,68 @@ function buildCandidateGroups(options = {}) {
       ],
       stopOnFailure: true,
       context,
-    });
+    }];
+  }
+
+  // Retain the platform scanners solely as dependency-injected unit-test
+  // fixtures for the upstream code. startBridge/forwardToThunderbird never
+  // pass this flag, so the executable safe bridge cannot autodiscover or switch
+  // between Thunderbird profiles.
+  if (options.allowAutodiscovery === true) {
+    const groups = [{
+      notes: [],
+      candidates: [makeCandidate('native tmp', getDefaultConnectionFile(context))],
+      stopOnFailure: false,
+      context,
+    }];
+    if (context.platform === 'darwin') {
+      groups.push({ ...findMacOsConnectionCandidates(context), stopOnFailure: false, context });
+    }
+    if (context.platform === 'linux') {
+      groups.push({ ...findSnapConnectionCandidates(context), stopOnFailure: false, context });
+      groups.push({ ...findFlatpakConnectionCandidates(context), stopOnFailure: false, context });
+    }
     return groups;
   }
 
-  groups.push({
-    notes: [],
-    candidates: [makeCandidate('native tmp', getDefaultConnectionFile(context))],
-    stopOnFailure: false,
+  return [{
+    notes: [
+      makeAttempt(
+        'configuration',
+        'THUNDERBIRD_MCP_CONNECTION_FILE',
+        'THUNDERBIRD_MCP_CONNECTION_FILE is required; automatic profile discovery is disabled'
+      ),
+    ],
+    candidates: [],
+    stopOnFailure: true,
     context,
-  });
+  }];
+}
 
-  if (context.platform === 'darwin') {
-    groups.push({ ...findMacOsConnectionCandidates(context), stopOnFailure: false, context });
+function validateConnectionProcess(pid, processImpl) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return { ok: false, reason: 'missing or invalid process id' };
   }
-
-  if (context.platform === 'linux') {
-    groups.push({ ...findSnapConnectionCandidates(context), stopOnFailure: false, context });
-    groups.push({ ...findFlatpakConnectionCandidates(context), stopOnFailure: false, context });
+  if (typeof processImpl?.kill !== 'function') {
+    // Dependency-injected discovery fixtures may not model process liveness.
+    return { ok: true };
   }
-
-  return groups;
+  try {
+    processImpl.kill(pid, 0);
+    return { ok: true };
+  } catch (err) {
+    if (err?.code === 'EPERM') {
+      // Signal 0 reached an existing process but the caller lacks permission.
+      return { ok: true };
+    }
+    if (err?.code === 'ESRCH') {
+      return { ok: false, reason: `process ${pid} is not running` };
+    }
+    return {
+      ok: false,
+      reason: `could not verify process ${pid} (${normalizeFsError(err)})`,
+    };
+  }
 }
 
 function tryReadConnectionCandidate(candidate, context) {
@@ -454,6 +495,19 @@ function tryReadConnectionCandidate(candidate, context) {
       return {
         ok: false,
         attempt: makeAttempt(candidate.label, candidate.path, 'missing port or token')
+      };
+    }
+    if (!SAFE_PROFILE_ID_PATTERN.test(data.profileId || '')) {
+      return {
+        ok: false,
+        attempt: makeAttempt(candidate.label, candidate.path, 'missing or invalid safe profile id')
+      };
+    }
+    const processState = validateConnectionProcess(data.pid, context.processImpl);
+    if (!processState.ok) {
+      return {
+        ok: false,
+        attempt: makeAttempt(candidate.label, candidate.path, processState.reason)
       };
     }
 
@@ -496,292 +550,6 @@ function discoverConnectionInfo(options = {}) {
   }
 
   return { candidates, attempts };
-}
-
-// Max raw bytes for an attachment read from a path before base64 encoding.
-// Encoded size grows ~33%, so 18 MB raw → ~24 MB base64, staying under the
-// extension's 25 MB MAX_BASE64_SIZE limit.
-const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
-// Keep these message-wide limits in sync with extension/mcp_server/api.js.
-const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-const MAX_ATTACHMENTS_PER_MESSAGE = 20;
-
-// File paths that an MCP caller must never be allowed to attach to outbound
-// mail. Keep the pattern list and helper behavior identical to the extension so
-// neither transport can bypass the LLM-confused-deputy defense.
-// Keep in sync with extension/mcp_server/api.js isSensitiveFilePath.
-const SENSITIVE_ATTACHMENT_PATTERNS = [
-  // SSH / PGP / cloud / kube / docker credentials
-  /\/\.ssh(\/|$)/,
-  /\/\.gnupg(\/|$)/,
-  /\/\.aws(\/|$)/,
-  /\/\.azure(\/|$)/,
-  /\/\.config\/gcloud(\/|$)/,
-  /\/\.kube(\/|$)/,
-  /\/\.docker(\/|$)/,
-  /\/\.netrc$/,
-  /\/\.npmrc$/,
-  /\/\.pypirc$/,
-  // Common key / secret file extensions anywhere on disk
-  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
-  /\.pem$/,
-  /\.pfx$/,
-  /\.p12$/,
-  /\.kdbx$/,
-  /\.key$/,
-  /\.asc$/,
-  /\.gpg$/,
-  // Linux / macOS system directories
-  /^\/etc\//,
-  /^\/proc\//,
-  /^\/sys\//,
-  /^\/root\//,
-  /^\/var\/log\//,
-  /^\/var\/lib\/sudo\//,
-  // macOS keychain locations
-  /\/library\/keychains\//,
-  // Windows system directories
-  /^[a-z]:\/windows\//,
-  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
-  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
-  // Browser credential stores (Firefox / Chrome / Edge)
-  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
-  // Thunderbird's own profile (contains the user's entire mail store + prefs).
-  // Linux profile directories and profiles.ini live directly under
-  // ~/.thunderbird (or ~/.icedove), while macOS and Windows use the platform
-  // application-data directories below. Block each profile root in full.
-  /\/\.(?:thunderbird|icedove)(\/|$)/,
-  /\/library\/thunderbird(\/|$)/,
-  /\/appdata\/roaming\/thunderbird(\/|$)/,
-];
-
-function isSensitiveFilePath(attachmentPath) {
-  if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
-  const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
-  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
-}
-
-// Tools whose `attachments` array may contain string file paths that this
-// bridge resolves on the host filesystem before forwarding. Needed because the
-// Thunderbird snap (and other sandboxed installs) cannot see arbitrary host
-// paths like /data/... or the host's /tmp; passing those paths through to the
-// extension results in silent "failed to attach" warnings since file.exists()
-// returns false inside the sandbox. Reading on the bridge side and shipping
-// inline base64 sidesteps the sandbox entirely.
-const ATTACHMENT_TOOLS = new Set(['sendMail', 'replyToMessage', 'forwardMessage']);
-
-// Minimal MIME map covering common attachment types (documents, images,
-// archives, A/V). Falls back to application/octet-stream which Thunderbird
-// handles fine.
-const MIME_BY_EXT = {
-  pdf: 'application/pdf',
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  gif: 'image/gif',
-  webp: 'image/webp',
-  svg: 'image/svg+xml',
-  bmp: 'image/bmp',
-  tif: 'image/tiff',
-  tiff: 'image/tiff',
-  heic: 'image/heic',
-  txt: 'text/plain',
-  csv: 'text/csv',
-  html: 'text/html',
-  htm: 'text/html',
-  md: 'text/markdown',
-  json: 'application/json',
-  xml: 'application/xml',
-  yml: 'application/yaml',
-  yaml: 'application/yaml',
-  zip: 'application/zip',
-  tar: 'application/x-tar',
-  gz: 'application/gzip',
-  '7z': 'application/x-7z-compressed',
-  doc: 'application/msword',
-  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  xls: 'application/vnd.ms-excel',
-  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  ppt: 'application/vnd.ms-powerpoint',
-  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  odt: 'application/vnd.oasis.opendocument.text',
-  ods: 'application/vnd.oasis.opendocument.spreadsheet',
-  odp: 'application/vnd.oasis.opendocument.presentation',
-  ics: 'text/calendar',
-  eml: 'message/rfc822',
-  mp3: 'audio/mpeg',
-  wav: 'audio/wav',
-  ogg: 'audio/ogg',
-  m4a: 'audio/mp4',
-  mp4: 'video/mp4',
-  webm: 'video/webm',
-  mov: 'video/quicktime'
-};
-
-function guessContentType(filePath) {
-  const ext = path.extname(filePath).toLowerCase().replace(/^\./, '');
-  return MIME_BY_EXT[ext] || 'application/octet-stream';
-}
-
-function attachmentError(action, filePath, error) {
-  if (error?.code === 'ENOENT') {
-    return new Error(`Attachment not found: ${filePath}`, { cause: error });
-  }
-  if (error?.code === 'EACCES' || error?.code === 'EPERM') {
-    return new Error(`Attachment unreadable (permission denied): ${filePath}`, { cause: error });
-  }
-  return new Error(`Attachment ${action} failed (${error?.code || 'unknown'}): ${filePath}`, { cause: error });
-}
-
-function validateAttachmentStat(filePath, stat) {
-  if (stat.isSymbolicLink()) {
-    throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`);
-  }
-  if (!stat.isFile()) {
-    throw new Error(`Attachment is not a regular file: ${filePath}`);
-  }
-  if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
-    throw new Error(`Attachment has an invalid file size: ${filePath}`);
-  }
-  if (stat.size > MAX_ATTACHMENT_BYTES) {
-    throw new Error(
-      `Attachment too large: ${filePath} is ${stat.size} bytes ` +
-      `(limit ${MAX_ATTACHMENT_BYTES} bytes / ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB raw before base64)`
-    );
-  }
-}
-
-async function inspectAttachmentPath(filePath) {
-  // Check both the supplied path and its lexical normalization before any
-  // filesystem access. The latter catches paths such as /tmp/../etc/passwd.
-  if (isSensitiveFilePath(filePath) || isSensitiveFilePath(path.resolve(filePath))) {
-    throw new Error(`Sensitive attachment path blocked: ${filePath}`);
-  }
-
-  let stat;
-  try {
-    // lstat is deliberate: stat would follow the final symlink before policy
-    // could reject it.
-    stat = await fs.promises.lstat(filePath);
-  } catch (e) {
-    throw attachmentError('lstat', filePath, e);
-  }
-  validateAttachmentStat(filePath, stat);
-  return { filePath, stat };
-}
-
-function sameFile(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
-async function readFileHandleExactly(handle, filePath, size) {
-  const buffer = Buffer.allocUnsafe(size);
-  let offset = 0;
-  while (offset < size) {
-    const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
-    if (bytesRead === 0) {
-      throw new Error(`Attachment changed while being read: ${filePath}`);
-    }
-    offset += bytesRead;
-  }
-
-  // Do not let a file that grew after fstat trigger an unbounded read.
-  const extra = Buffer.allocUnsafe(1);
-  const { bytesRead } = await handle.read(extra, 0, 1, size);
-  if (bytesRead !== 0) {
-    throw new Error(`Attachment changed while being read: ${filePath}`);
-  }
-
-  return buffer;
-}
-
-// Read a preflighted file path off the host filesystem and convert it to the
-// inline { name, contentType, base64 } shape the extension supports. Opening
-// with O_NOFOLLOW where available and comparing the opened file to the lstat
-// snapshot prevents a path swap from redirecting the read to a symlink/other
-// inode between policy validation and I/O.
-async function readAttachmentFromPath(fileInfo) {
-  const { filePath, stat: preflightStat } = fileInfo;
-  const freshInfo = await inspectAttachmentPath(filePath);
-  if (!sameFile(preflightStat, freshInfo.stat) || preflightStat.size !== freshInfo.stat.size) {
-    throw new Error(`Attachment changed after validation: ${filePath}`);
-  }
-
-  const noFollow = fs.constants.O_NOFOLLOW || 0;
-  let handle;
-  try {
-    handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | noFollow);
-  } catch (e) {
-    if (e?.code === 'ELOOP') {
-      throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`, { cause: e });
-    }
-    throw attachmentError('open', filePath, e);
-  }
-
-  try {
-    let openedStat;
-    try {
-      openedStat = await handle.stat();
-    } catch (e) {
-      throw attachmentError('fstat', filePath, e);
-    }
-    validateAttachmentStat(filePath, openedStat);
-    if (!sameFile(freshInfo.stat, openedStat) || freshInfo.stat.size !== openedStat.size) {
-      throw new Error(`Attachment changed after validation: ${filePath}`);
-    }
-    const buffer = await readFileHandleExactly(handle, filePath, openedStat.size);
-    return {
-      name: path.basename(filePath),
-      contentType: guessContentType(filePath),
-      base64: buffer.toString('base64')
-    };
-  } finally {
-    await handle.close();
-  }
-}
-
-// Replace every string entry in `args.attachments` (= file path) with an
-// inline { name, contentType, base64 } object read off the host filesystem.
-// Inline objects pass through unchanged. All paths and message-wide limits are
-// preflighted before the first read, then files are read sequentially so a
-// caller cannot force many large buffers to be resident at once.
-async function inlineAttachmentPaths(args) {
-  if (!args || !Array.isArray(args.attachments)) return;
-
-  if (args.attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-    throw new Error(
-      `Attachment count ${args.attachments.length} exceeds the ` +
-      `${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`
-    );
-  }
-
-  const fileInfoByIndex = new Map();
-  let totalAttachmentBytes = 0;
-  for (let index = 0; index < args.attachments.length; index++) {
-    const entry = args.attachments[index];
-    if (typeof entry !== 'string') continue;
-
-    const fileInfo = await inspectAttachmentPath(entry);
-    if (fileInfo.stat.size > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
-      throw new Error(
-        `Attachment aggregate too large at ${entry}: exceeds the ` +
-        `${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024} MB aggregate attachment limit`
-      );
-    }
-    totalAttachmentBytes += fileInfo.stat.size;
-    fileInfoByIndex.set(index, fileInfo);
-  }
-
-  const resolved = [];
-  for (let index = 0; index < args.attachments.length; index++) {
-    const entry = args.attachments[index];
-    resolved.push(
-      typeof entry === 'string'
-        ? await readAttachmentFromPath(fileInfoByIndex.get(index))
-        : entry
-    );
-  }
-  args.attachments = resolved;
 }
 
 /**
@@ -916,25 +684,6 @@ async function handleMessage(line) {
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
   }
 
-  // For mail-sending tools, inline any attachments passed as file paths.
-  // The Thunderbird extension may run inside a sandboxed snap that cannot
-  // see /data/..., the host /tmp, or any path outside its confined view —
-  // letting paths through results in silent "failed to attach" warnings.
-  // Reading on the bridge side and shipping base64 sidesteps the sandbox.
-  if (message.method === 'tools/call'
-      && message.params
-      && ATTACHMENT_TOOLS.has(message.params.name)) {
-    try {
-      await inlineAttachmentPaths(message.params.arguments);
-    } catch (e) {
-      return {
-        jsonrpc: '2.0',
-        id: message.id,
-        error: { code: -32602, message: e.message }
-      };
-    }
-  }
-
   return forwardToThunderbird(message);
 }
 
@@ -1059,9 +808,9 @@ async function forwardToThunderbird(message) {
     }
   }
 
-  // Walk through the cached candidate list on retryable failures so a stale
-  // connection.json can't permanently mask a live one further down the list.
-  // After the cached list is exhausted, rediscover once before giving up.
+  // The safe build accepts one explicitly pinned profile file only. A retry may
+  // re-read that exact path after Thunderbird refreshes it, but it never
+  // switches to a different profile or discovery candidate.
   let rediscoveryAttempted = false;
 
   while (connInfo) {
@@ -1212,14 +961,7 @@ module.exports = {
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
   compactToolResultJsonText,
-  inlineAttachmentPaths,
-  isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
-  attachmentLimits: {
-    MAX_ATTACHMENT_BYTES,
-    MAX_TOTAL_ATTACHMENT_BYTES,
-    MAX_ATTACHMENTS_PER_MESSAGE,
-  },
 };

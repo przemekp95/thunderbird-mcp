@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Thunderbird MCP Safe</title>
+  <link rel="stylesheet" href="options-safe.css">
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">LOCAL REVIEWED PILOT</p>
+      <h1>Thunderbird MCP Safe</h1>
+      <p>
+        No mail account or address book is accessible until you select it.
+        The build supports reviewed mail and contact workflows. Direct sending
+        is a separate, default-off capability with sender, recipient, quota,
+        and audit controls. Permanent deletion and non-local listening remain
+        unavailable.
+      </p>
+    </header>
+
+    <section aria-labelledby="server-heading">
+      <h2 id="server-heading">Local server</h2>
+      <dl>
+        <div><dt>Status</dt><dd id="serverStatus">Checking…</dd></div>
+        <div><dt>Port</dt><dd id="serverPort">—</dd></div>
+        <div><dt>Safe profile ID</dt><dd id="serverProfileId">—</dd></div>
+        <div><dt>Connection file</dt><dd id="serverConnectionFile">—</dd></div>
+        <div><dt>Build</dt><dd id="buildVersion">—</dd></div>
+      </dl>
+      <p class="note">
+        The MCP client must be configured with this exact connection file.
+        Automatic profile discovery is disabled.
+      </p>
+    </section>
+
+    <section aria-labelledby="accounts-heading">
+      <h2 id="accounts-heading">Allowed mail accounts</h2>
+      <p class="note">
+        Select only the account needed for the pilot. Clearing every checkbox
+        immediately restores the deny-all state.
+      </p>
+      <form id="accountForm">
+        <fieldset id="accountList" aria-describedby="accountStatus">
+          <legend class="visually-hidden">Mail accounts</legend>
+          <p>Loading accounts…</p>
+        </fieldset>
+        <div class="actions">
+          <button type="submit" id="saveAccounts">Save account access</button>
+          <span id="accountStatus" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </section>
+
+    <section aria-labelledby="address-books-heading">
+      <h2 id="address-books-heading">Allowed address books</h2>
+      <p class="note">
+        Contact access has its own allow-list. Clearing every checkbox blocks
+        all contact reads and changes.
+      </p>
+      <form id="addressBookForm">
+        <fieldset id="addressBookList" aria-describedby="addressBookStatus">
+          <legend class="visually-hidden">Address books</legend>
+          <p>Loading address books…</p>
+        </fieldset>
+        <div class="actions">
+          <button type="submit" id="saveAddressBooks">Save address-book access</button>
+          <span id="addressBookStatus" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </section>
+
+    <section aria-labelledby="direct-send-heading">
+      <h2 id="direct-send-heading">Automatic direct sending</h2>
+      <p class="warning">
+        High-impact capability. When enabled, <code>sendMailDirect</code> sends
+        immediately without opening a compose window. Email content is never
+        written to the audit log.
+      </p>
+      <form id="directSendForm">
+        <label class="toggle">
+          <input type="checkbox" id="directSendEnabled">
+          <span>Enable <code>sendMailDirect</code></span>
+        </label>
+
+        <fieldset id="directSendAccountList">
+          <legend>Accounts allowed to send automatically</legend>
+          <p>Loading accounts…</p>
+        </fieldset>
+
+        <label class="field">
+          <span>Optional recipient restrictions</span>
+          <textarea id="directSendRecipients" rows="6" spellcheck="false"
+            placeholder="person@example.com&#10;*@trusted.example"></textarea>
+          <small>Leave empty to allow any syntactically valid recipient. To restrict sending, enter one exact mailbox or <code>*@domain.example</code> per line.</small>
+        </label>
+
+        <div class="field-grid">
+          <label class="field">
+            <span>Maximum recipients per message</span>
+            <input type="number" id="directSendMaxRecipients" min="1" max="10" value="1">
+          </label>
+          <label class="field">
+            <span>Maximum accepted attempts per UTC day</span>
+            <input type="number" id="directSendDailyLimit" min="1" max="100" value="10">
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Confirmation phrase required when enabling</span>
+          <input type="text" id="directSendConfirmation" autocomplete="off"
+            placeholder="ENABLE DIRECT SEND">
+          <small>Type exactly: <code>ENABLE DIRECT SEND</code></small>
+        </label>
+
+        <dl class="direct-send-status">
+          <div><dt>Quota</dt><dd id="directSendQuota">—</dd></div>
+          <div><dt>Audit log</dt><dd id="directSendAuditPath">—</dd></div>
+        </dl>
+
+        <div class="actions">
+          <button type="submit" id="saveDirectSend">Save direct-send policy</button>
+          <span id="directSendStatus" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </section>
+
+    <section aria-labelledby="policy-heading">
+      <h2 id="policy-heading">Fixed safety policy</h2>
+      <ul>
+        <li>Mail: bounded reads, HTML/raw access, saved attachments, drafts, reviewed compose/reply/forward, separately authorized direct sending, organization, and Trash-only deletion.</li>
+        <li>Contacts: search, read, create, and update inside explicitly selected address books; permanent contact deletion is unavailable.</li>
+        <li>Email and contact fields are untrusted data with control-character cleanup and size limits.</li>
+        <li>Direct sending is hidden unless locally enabled and remains limited to selected accounts and recipients, three inline attachments, per-message recipient caps, and a daily attempt quota.</li>
+        <li>Calendars, filters, permanent deletion, and host-path attachments are unavailable.</li>
+        <li>The bearer token rotates whenever the extension server starts.</li>
+        <li>Automatic add-on updates are disabled for this local fork.</li>
+      </ul>
+    </section>
+  </main>
+  <script src="options-safe.js"></script>
+</body>
+</html>

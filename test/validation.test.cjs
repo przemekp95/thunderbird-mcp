@@ -41,6 +41,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
   vm.runInContext([
     getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND POLICY', '// END DIRECT SEND POLICY'),
     getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
@@ -49,7 +50,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
     'this.buildTools = buildTools;',
     'this.validateAgainstSchema = validateAgainstSchema;',
     'this.filePathsToAttachDescs = filePathsToAttachDescs;',
-    'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
+    'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES };',
   ].join('\n'), sandbox);
   return sandbox;
 }
@@ -81,6 +82,14 @@ function validateProductionToolArgs(name, args) {
         errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
       }
     }
+  }
+  if (schema.anyOf || schema.oneOf) {
+    productionAttachmentValidation.validateAgainstSchema(
+      args,
+      { anyOf: schema.anyOf, oneOf: schema.oneOf },
+      'arguments',
+      errors
+    );
   }
   return errors;
 }
@@ -183,6 +192,9 @@ function validateAgainstSchema(value, schema, path, errors) {
   if (expectedType === "string") {
     if (schema.minLength !== undefined && value.length < schema.minLength) {
       errors.push(`Parameter '${path}' must contain at least ${schema.minLength} character(s)`);
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+      errors.push(`Parameter '${path}' must contain at most ${schema.maxLength} character(s)`);
     }
     if (schema.contentEncoding === "base64" && !productionAttachmentValidation.isValidBase64(value)) {
       errors.push(`Parameter '${path}' must contain valid base64 data`);
@@ -515,6 +527,30 @@ describe('Validation: pagination parameters', () => {
 });
 
 describe('Validation: folder management', () => {
+  it('createFolder accepts an account id for a top-level folder', () => {
+    const errors = validateProductionToolArgs('createFolder', {
+      accountId: 'account2',
+      name: 'MCP Folder',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('createFolder accepts a verified parent path for a nested folder', () => {
+    const errors = validateProductionToolArgs('createFolder', {
+      parentFolderPath: 'imap://user@server/Archive',
+      name: 'MCP Folder',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('createFolder requires either accountId or parentFolderPath', () => {
+    const errors = validateProductionToolArgs('createFolder', {
+      name: 'MCP Folder',
+    });
+    assert.ok(errors.length > 0);
+    assert.ok(errors.some(error => /schema alternative|required/.test(error)));
+  });
+
   it('renameFolder requires both params', () => {
     const errors = validate('renameFolder', {});
     assert.equal(errors.length, 2);
@@ -814,25 +850,20 @@ describe('Validation: attachment sending', () => {
     assert.match(result.failed[0], /garbage\.bin \(invalid base64 data\)/);
   });
 
-  it('production schemas and runtime enforce the per-message attachment count cap', () => {
-    const maxCount = productionAttachmentValidation.attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE;
-    const entries = Array.from({ length: maxCount + 1 }, (_, index) => `/tmp/file-${index}.txt`);
+  it('production schemas and runtime do not impose an attachment count cap', () => {
+    const entries = Array.from({ length: 21 }, (_, index) => `/tmp/file-${index}.txt`);
     for (const [toolName, requiredArgs] of Object.entries(productionToolArgs)) {
       const errors = validateProductionToolArgs(toolName, {
         ...requiredArgs,
         attachments: entries,
       });
-      assert.ok(
-        errors.some(error => error.includes(`at most ${maxCount}`)),
-        `${toolName}: ${errors.join('; ')}`
-      );
+      assert.deepEqual(errors, [], `${toolName}: ${errors.join('; ')}`);
     }
 
     const files = new Map(entries.map(entry => [entry, makeMockLocalFile(entry)]));
     const { result } = convertProductionFileAttachments(entries, files);
-    assert.equal(result.descs.length, maxCount);
-    assert.equal(result.failed.length, 1);
-    assert.match(result.failed[0], new RegExp(`Attachment count ${maxCount + 1} exceeds the ${maxCount} attachment limit`));
+    assert.equal(result.descs.length, entries.length);
+    assert.equal(result.failed.length, 0);
   });
 
   it('production runtime enforces a 50MB aggregate attachment cap', () => {
@@ -948,7 +979,9 @@ describe('Production contact schemas and dispatch', () => {
 
   it('passes contact arguments to handlers in production schema order', () => {
     for (const name of ['getContact', 'createContact', 'updateContact']) {
-      const match = new RegExp(`case "${name}":\\s*return ${name}\\(([^)]*)\\);`)
+      const match = new RegExp(
+        `case "${name}":\\s*return hardenContactResult\\(${name}\\(([^)]*)\\)\\);`
+      )
         .exec(productionContacts.source);
       assert.ok(match, `${name} dispatch missing`);
       const actualArgs = match[1].split(',').map(value => value.trim());
@@ -1272,6 +1305,68 @@ describe('Validator: oneOf items (attachments)', () => {
   });
 });
 
+describe('Validator: sendMailDirect bounds', () => {
+  const base = {
+    to: 'recipient@example.com',
+    subject: 'subject',
+    body: 'body',
+    from: 'sender@example.com',
+  };
+
+  it('accepts the bounded direct-send shape', () => {
+    assert.deepEqual(validateProductionToolArgs('sendMailDirect', base), []);
+    assert.deepEqual(validateProductionToolArgs('sendMailDirect', {
+      ...base,
+      smtpPassword: 'one-use-password',
+    }), []);
+  });
+
+  it('rejects malformed transient SMTP passwords', () => {
+    assert.ok(validateProductionToolArgs('sendMailDirect', {
+      ...base,
+      smtpPassword: '',
+    }).length > 0);
+    assert.ok(validateProductionToolArgs('sendMailDirect', {
+      ...base,
+      smtpPassword: 'x'.repeat(1025),
+    }).length > 0);
+  });
+
+  it('rejects skipReview and host-path attachments', () => {
+    assert.ok(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        skipReview: true,
+      }).some(error => /Unknown parameter: skipReview/.test(error))
+    );
+    assert.ok(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        attachments: ['/tmp/file.txt'],
+      }).some(error => /attachments\[0\].*object/.test(error))
+    );
+  });
+
+  it('rejects an oversized subject but accepts more than three attachments', () => {
+    assert.ok(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        subject: 'x'.repeat(999),
+      }).some(error => /at most 998/.test(error))
+    );
+    assert.deepEqual(
+      validateProductionToolArgs('sendMailDirect', {
+        ...base,
+        attachments: Array.from(
+          { length: 4 },
+          (_, index) => ({ name: `${index}.txt`, base64: 'eA==' })
+        ),
+      }),
+      []
+    );
+  });
+});
+
 describe('Validator: integer type', () => {
   it('accepts whole numbers for integer fields', () => {
     const errors = richValidator('createTask', { title: 't', priority: 5 });
@@ -1445,5 +1540,21 @@ describe('isSensitiveFilePath: case insensitivity and slash normalization', () =
   it('treats backslashes and forward slashes as equivalent boundaries', () => {
     assert.equal(isSensitiveFilePath('C:/Users/x/.ssh/id_rsa'), true);
     assert.equal(isSensitiveFilePath('C:\\Users\\x\\.ssh\\id_rsa'), true);
+  });
+});
+
+
+describe('Validator: reviewed compose sending', () => {
+  const valid = { windowId: 'window-1', expectedRevision: 'a'.repeat(64), confirmSend: true };
+  it('accepts an explicit confirmation bound to a SHA-256 revision', () => {
+    assert.deepEqual(validateProductionToolArgs('sendComposeWindow', valid), []);
+  });
+  it('rejects absent approval, invalid revisions and unknown arguments', () => {
+    for (const args of [
+      { ...valid, confirmSend: false },
+      { windowId: valid.windowId, expectedRevision: valid.expectedRevision },
+      { ...valid, expectedRevision: 'stale' },
+      { ...valid, skipReview: true },
+    ]) assert.ok(validateProductionToolArgs('sendComposeWindow', args).length > 0);
   });
 });

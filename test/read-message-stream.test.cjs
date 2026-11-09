@@ -89,5 +89,6 @@ describe("readMessageStreamFully", () => {
     };
     const result = readMessageStreamFully(stream, undefined, readChunk);
     assert.equal(result.length, 1024);
+    assert.equal(cursor, 1024);
   });
 });

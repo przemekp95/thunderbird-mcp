@@ -1,12 +1,11 @@
 {
   "manifest_version": 2,
-  "name": "Thunderbird MCP",
-  "version": "0.7.4",
-  "description": "MCP server for AI assistants to access email, contacts, and calendars",
+  "name": "Thunderbird MCP Safe",
+  "version": "0.4.10",
+  "description": "Hardened local MCP access to selected Thunderbird mail accounts, address books, and safe persistent filters",
   "browser_specific_settings": {
     "gecko": {
-      "id": "thunderbird-mcp@tkasperczyk.dev",
-      "update_url": "https://updates.tomaszkasperczyk.name/thunderbird-mcp/updates.json",
+      "id": "thunderbird-mcp-safe@local.invalid",
       "strict_min_version": "102.0",
       "strict_max_version": "200.*"
     }
@@ -41,14 +40,14 @@
     }
   },
   "options_ui": {
-    "page": "options.html"
+    "page": "options-safe.html"
   },
   "permissions": [
     "accountsRead",
-    "addressBooks",
     "messagesRead",
-    "messagesMove",
     "accountsFolders",
+    "messagesMove",
+    "addressBooks",
     "compose"
   ],
   "web_accessible_resources": []

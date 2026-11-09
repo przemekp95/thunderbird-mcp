@@ -5,7 +5,7 @@ on:
     paths:
       - "extension/**"
       - "package.json"
-      - "scripts/build.sh"
+      - "scripts/build-xpi.cjs"
       - ".github/workflows/tb-compat-test.yml"
 
 permissions:
@@ -133,8 +133,8 @@ jobs:
               || fail_infra "failed to install libasound"
           fi
 
-          bash scripts/build.sh || fail_infra "scripts/build.sh failed"
-          [ -f dist/thunderbird-mcp.xpi ] || fail_infra "dist/thunderbird-mcp.xpi was not produced"
+          node scripts/build-xpi.cjs || fail_infra "scripts/build-xpi.cjs failed"
+          [ -f dist/thunderbird-mcp-safe.xpi ] || fail_infra "dist/thunderbird-mcp-safe.xpi was not produced"
 
           case "$TB_CHANNEL" in
             stable) version_key="LATEST_THUNDERBIRD_VERSION" ;;
@@ -177,7 +177,7 @@ jobs:
 
           profile_dir="$(mktemp -d)" || fail_infra "failed to create test profile"
           mkdir -p "$profile_dir/extensions" || fail_infra "failed to create extension profile directory"
-          cp dist/thunderbird-mcp.xpi "$profile_dir/extensions/thunderbird-mcp@tkasperczyk.dev.xpi" \
+          cp dist/thunderbird-mcp-safe.xpi "$profile_dir/extensions/thunderbird-mcp-safe@local.invalid.xpi" \
             || fail_infra "failed to install XPI into test profile"
           cat > "$profile_dir/user.js" <<'PREFS'
           user_pref("extensions.experiments.enabled", true);
@@ -194,7 +194,7 @@ jobs:
           read_addon_state() {
             EXT_JSON="$ext_json" node <<'NODE'
           const fs = require('fs');
-          const addonId = 'thunderbird-mcp@tkasperczyk.dev';
+          const addonId = 'thunderbird-mcp-safe@local.invalid';
 
           function done(result) {
             process.stdout.write(JSON.stringify(result));

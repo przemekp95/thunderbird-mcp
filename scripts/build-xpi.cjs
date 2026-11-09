@@ -9,7 +9,7 @@ const zlib = require('zlib');
 const PROJECT_DIR = path.resolve(__dirname, '..');
 const EXT_DIR = path.join(PROJECT_DIR, 'extension');
 const DIST_DIR = path.join(PROJECT_DIR, 'dist');
-const OUT_FILE = path.join(DIST_DIR, 'thunderbird-mcp.xpi');
+const OUT_FILE = path.join(DIST_DIR, 'thunderbird-mcp-safe.xpi');
 const PACKAGE_FILE = path.join(PROJECT_DIR, 'package.json');
 
 function crc32(buf) {
@@ -94,7 +94,9 @@ class ZipWriter {
 }
 
 function addDir(zip, dir, prefix) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
     const full = path.join(dir, entry.name);
     const zipPath = prefix ? prefix + '/' + entry.name : entry.name;
     if (entry.isDirectory()) {
@@ -118,31 +120,78 @@ function readPackageVersion() {
   }
 }
 
-// Stamp buildinfo.json with git describe version and timestamp
-const { execSync } = require('child_process');
+// Stamp buildinfo.json from source state only, so unchanged sources produce
+// byte-identical XPI files. SOURCE_DATE_EPOCH follows the standard reproducible
+// builds convention; otherwise use the current Git commit time.
+const { execFileSync } = require('child_process');
 const BUILDINFO_FILE = path.join(EXT_DIR, 'buildinfo.json');
 const MANIFEST_FILE = path.join(EXT_DIR, 'manifest.json');
 const packageVersion = readPackageVersion();
+let buildVersion = `v${packageVersion}+source`;
+let buildEpochSeconds = 0;
 try {
   // Produces e.g. "v1.2.0-3-g1461f1a" (tag + commits past tag + hash)
-  let buildVersion;
   try {
-    buildVersion = execSync('git describe --tags --always', { cwd: PROJECT_DIR, encoding: 'utf8' }).trim();
+    buildVersion = execFileSync(
+      'git',
+      ['describe', '--tags', '--always'],
+      { cwd: PROJECT_DIR, encoding: 'utf8' }
+    ).trim();
   } catch {
     // No tags exist -- fall back to short hash
-    buildVersion = execSync('git rev-parse --short HEAD', { cwd: PROJECT_DIR, encoding: 'utf8' }).trim();
+    buildVersion = execFileSync(
+      'git',
+      ['rev-parse', '--short', 'HEAD'],
+      { cwd: PROJECT_DIR, encoding: 'utf8' }
+    ).trim();
   }
-  // Append +dirty if there are uncommitted changes
-  try {
-    execSync('git diff --quiet && git diff --cached --quiet', { cwd: PROJECT_DIR });
-  } catch {
+
+  // Generated buildinfo and dist output must not make a second identical build
+  // look dirty. Every other tracked or untracked source change still does.
+  const dirtyStatus = execFileSync(
+    'git',
+    [
+      'status',
+      '--porcelain',
+      '--untracked-files=normal',
+      '--',
+      '.',
+      ':(exclude)extension/buildinfo.json',
+      ':(exclude)dist',
+    ],
+    { cwd: PROJECT_DIR, encoding: 'utf8' }
+  ).trim();
+  if (dirtyStatus) {
     buildVersion += '+dirty';
   }
-  const buildInfo = JSON.stringify({ version: buildVersion, builtAt: new Date().toISOString() });
-  fs.writeFileSync(BUILDINFO_FILE, buildInfo);
+
+  buildEpochSeconds = Number(execFileSync(
+    'git',
+    ['log', '-1', '--format=%ct'],
+    { cwd: PROJECT_DIR, encoding: 'utf8' }
+  ).trim());
 } catch {
-  console.warn('Warning: could not stamp buildinfo.json (git not available?)');
+  console.warn('Warning: Git metadata unavailable; using deterministic source fallback');
 }
+
+if (Object.prototype.hasOwnProperty.call(process.env, 'SOURCE_DATE_EPOCH')) {
+  const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH;
+  if (!/^\d+$/.test(sourceDateEpoch || '')) {
+    console.error('Error: SOURCE_DATE_EPOCH must be a non-negative integer');
+    process.exit(1);
+  }
+  buildEpochSeconds = Number(sourceDateEpoch);
+}
+const builtAt = new Date(buildEpochSeconds * 1000);
+if (!Number.isSafeInteger(buildEpochSeconds) || Number.isNaN(builtAt.getTime())) {
+  console.error('Error: build timestamp is outside the supported date range');
+  process.exit(1);
+}
+const buildInfo = JSON.stringify({
+  version: buildVersion,
+  builtAt: builtAt.toISOString(),
+});
+fs.writeFileSync(BUILDINFO_FILE, buildInfo);
 
 try {
   const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
