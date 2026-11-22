@@ -997,6 +997,7 @@ const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp-safe.disabledTools";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp-safe.blockSkipReview";
 const PREF_GET_MESSAGES_LIMIT = "extensions.thunderbird-mcp-safe.getMessagesLimit";
 // BEGIN DIRECT SEND POLICY
+const PREF_FULL_MAIL_ACCESS = "extensions.thunderbird-mcp-safe.fullMailAccess";
 const PREF_DIRECT_SEND_ENABLED = "extensions.thunderbird-mcp-safe.directSendEnabled";
 const PREF_DIRECT_SEND_ACCOUNTS = "extensions.thunderbird-mcp-safe.directSendAccounts";
 const PREF_DIRECT_SEND_RECIPIENTS = "extensions.thunderbird-mcp-safe.directSendRecipients";
@@ -1227,6 +1228,42 @@ function evaluateDirectSendRequest(config, request, usedToday) {
   return { ok: true, recipients: parsed.recipients };
 }
 
+// Explicit, reversible full-access mode; existing granular lists remain intact.
+function fullMailAccessEnabled() {
+  try { return Services.prefs.getBoolPref(PREF_FULL_MAIL_ACCESS, false) === true; }
+  catch { return false; }
+}
+function fullMailAccessIds(kind) {
+  if (!fullMailAccessEnabled()) return null;
+  const { MailServices } = ChromeUtils.importESModule("resource:///modules/MailServices.sys.mjs");
+  if (kind === "accounts") return Array.from(MailServices.accounts.accounts, a => a.key);
+  if (kind === "addressBooks") return Array.from(MailServices.ab.directories, b => b.UID);
+  throw new Error("Unknown access collection");
+}
+
+function setFullMailAccess(args) {
+  const failure = { success: false, error: "Full access change was invalid or could not be persisted" };
+  if (!args || args.confirmChange !== true || typeof args.enabled !== "boolean" ||
+      Object.keys(args).some(key => key !== "enabled" && key !== "confirmChange")) return failure;
+  const prefs = Services.prefs;
+  const key = PREF_FULL_MAIL_ACCESS;
+  try {
+    const before = prefs.getBoolPref(key, false);
+    const hadUserValue = prefs.prefHasUserValue?.(key) ?? true;
+    try {
+      prefs.setBoolPref(key, args.enabled);
+      prefs.savePrefFile(null);
+    } catch {
+      if (hadUserValue) prefs.setBoolPref(key, before);
+      else prefs.clearUserPref(key);
+      return failure;
+    }
+    return { success: true, mode: args.enabled ? "all" : "granular", directSendCapability: args.enabled };
+  } catch {
+    return failure;
+  }
+}
+
 function readDirectSendConfigFromPrefs() {
   const defaults = {
     enabled: false,
@@ -1236,13 +1273,14 @@ function readDirectSendConfigFromPrefs() {
     dailyLimit: DIRECT_SEND_DEFAULT_DAILY_LIMIT,
   };
   try {
-    const enabled = Services.prefs.getBoolPref(PREF_DIRECT_SEND_ENABLED, false);
+    const fullAccounts = fullMailAccessIds("accounts");
+    const enabled = fullAccounts !== null || Services.prefs.getBoolPref(PREF_DIRECT_SEND_ENABLED, false);
     const accountsRaw = Services.prefs.getStringPref(PREF_DIRECT_SEND_ACCOUNTS, "");
     const recipientsRaw = Services.prefs.getStringPref(PREF_DIRECT_SEND_RECIPIENTS, "");
     const candidate = {
       enabled,
-      allowedAccountIds: accountsRaw ? JSON.parse(accountsRaw) : [],
-      allowedRecipients: recipientsRaw ? JSON.parse(recipientsRaw) : [],
+      allowedAccountIds: fullAccounts ?? (accountsRaw ? JSON.parse(accountsRaw) : []),
+      allowedRecipients: fullAccounts === null && recipientsRaw ? JSON.parse(recipientsRaw) : [],
       maxRecipientsPerMessage: Services.prefs.getIntPref(
         PREF_DIRECT_SEND_MAX_RECIPIENTS,
         DIRECT_SEND_DEFAULT_MAX_RECIPIENTS
@@ -1766,6 +1804,7 @@ const SAFE_TOOL_NAMES = new Set([
   "displayMessage",
   "listThunderbirdWindows",
   "getComposeWindow",
+  "saveComposeWindow",
   "sendComposeWindow",
   "controlMailMerge",
   "getComposeSendStatus",
@@ -1793,6 +1832,9 @@ const SAFE_TOOL_NAMES = new Set([
   "disableFilter",
   "deleteFilter",
   "getAccountAccess",
+  "getMailAccountConfiguration",
+  "setFullMailAccess",
+  "refreshMailAccount",
 ]);
 const SAFE_MESSAGE_BODY_MAX_CHARS = 12000;
 const SAFE_HTML_BODY_MAX_CHARS = 50000;
@@ -1955,12 +1997,13 @@ function buildSafeToolDefinitions(allTools) {
         );
       } else if (tool.name === "sendMailDirect") {
         delete safeTool.inputSchema.properties.skipReview;
-        safeTool.description = "Send immediately without opening a compose window. This tool is hidden and blocked unless the user enables direct sending for the sender account in Thunderbird settings. An optional recipient list can narrow delivery; an empty list permits any syntactically valid recipient. Every accepted attempt consumes daily quota and is written to a private local audit log.";
+        safeTool.description = "Send immediately without opening a compose window. This tool is hidden and blocked unless the user enables direct sending for the sender account in Thunderbird settings. An optional recipient list can narrow delivery; an empty list permits any syntactically valid recipient. Full access requires confirmSend and an explicitly assigned SMTP server. Every accepted attempt is counted and written to a private local audit log.";
         safeTool.inputSchema.properties = pickSchemaProperties(
           safeTool.inputSchema.properties,
           ["to", "subject", "body", "cc", "bcc", "isHtml", "from", "attachments", "smtpPassword"]
         );
         safeTool.inputSchema.properties.attachments = inlineAttachmentSchema;
+        safeTool.inputSchema.properties.confirmSend = { type: "boolean", enum: [true] };
         safeTool.inputSchema.required = ["to", "subject", "body", "from"];
       } else if (["sendMail", "saveDraft", "replyToMessage", "forwardMessage"].includes(tool.name)) {
         delete safeTool.inputSchema.properties.skipReview;
@@ -2095,7 +2138,7 @@ function buildSafeToolDefinitions(allTools) {
       } else if (tool.name === "renameFolder") {
         safeTool.description = "Rename a non-system mail folder.";
       } else if (tool.name === "getAccountAccess") {
-        safeTool.description = "Show the currently accessible mail accounts and address books. Configuration remains available only in Thunderbird's options page.";
+        safeTool.description = "Show currently accessible accounts and address books. Configure granular selections in Thunderbird options or change the explicit full-access opt-in with setFullMailAccess.";
       }
 
       return safeTool;
@@ -2527,19 +2570,51 @@ function respondToSmtpPrompt(windowId, password, rememberPassword = false) {
 }
 // END THUNDERBIRD WINDOW CONTROLS
 
-// Mail Merge uses the native compose transport. Require an explicit live SMTP
-// binding for supported account types before letting it submit a batch.
-function hasExplicitMailMergeSmtp(identity, accountId, mailServices) {
-  if (!identity?.key || !accountId || !identity.smtpServerKey) return false;
+// Mail Merge uses the native compose transport. Preflight and authorization
+// inspect the same explicit binding without default SMTP fallback.
+function inspectMailMergeSmtp(identity, accountId, mailServices) {
+  const details = { identityId: identity?.key, accountId };
+  const unavailable = code => ({ ...details, supported: false, code });
+  if (!identity?.key) return unavailable("identity-unavailable");
+  if (!identity.smtpServerKey) return unavailable("smtp-not-configured");
   const owners = Array.from(mailServices.accounts.accounts).filter(account =>
     Array.from(account.identities).some(candidate => candidate.key === identity.key)
   );
-  if (owners.length !== 1 || owners[0].key !== accountId ||
-      !["imap", "pop3", "none"].includes(owners[0].incomingServer?.type)) return false;
+  if (owners.length !== 1 || owners[0].key !== accountId) return unavailable("identity-unavailable");
+  if (!["imap", "pop3", "none"].includes(owners[0].incomingServer?.type)) {
+    return unavailable("native-compose-required");
+  }
   const servers = Array.from(mailServices.outgoingServer?.servers ?? []).filter(
     server => server.key === identity.smtpServerKey
   );
-  return servers.length === 1 && servers[0].type === "smtp" && !!servers[0].hostname?.trim();
+  const server = servers.length === 1 ? servers[0] : null;
+  if (server?.type !== "smtp") return unavailable("smtp-unavailable");
+  try {
+    const smtp = server.QueryInterface(Ci.nsISmtpServer);
+    if (typeof smtp.hostname !== "string" || !smtp.hostname.trim()) return unavailable("smtp-unavailable");
+    return { ...details, supported: true, transport: "smtp", smtpServerKey: server.key,
+      hostname: smtp.hostname, port: smtp.port, socketType: server.socketType };
+  } catch {
+    return unavailable("smtp-unavailable");
+  }
+}
+
+function inspectMailingAccount(accountId, mailServices, canAccess, config) {
+  const unavailable = { success: false, error: "Account is unavailable or not accessible" };
+  try {
+    if (!canAccess(accountId)) return unavailable;
+    const account = Array.from(mailServices.accounts.accounts).find(candidate => candidate.key === accountId);
+    if (!account) return unavailable;
+    return {
+      success: true,
+      accountId,
+      directSendAllowed: config.enabled && !config.error && config.allowedAccountIds.includes(accountId),
+      directSendTransports: Array.from(account.identities, identity => inspectMailMergeSmtp(identity, accountId, mailServices)),
+      smtpVerified: false,
+    };
+  } catch {
+    return unavailable;
+  }
 }
 
 // BEGIN COMPOSE WINDOW CONTROLS
@@ -2616,6 +2691,79 @@ function composeOwnedPrompts(win) {
 // Attempts are retained after window closure: a completed or uncertain attempt
 // must never become permission to send the same editor again.
 const composeSendAttempts = new Map();
+async function saveComposeWindow(windowId, expectedRevision, closeAfterSave, access) {
+  let win;
+  let listener;
+  let timeout;
+  let unlockTimer;
+  let compose;
+  try {
+    if (typeof closeAfterSave !== "boolean") return { success: false, error: "closeAfterSave must be a boolean" };
+    win = selectedComposeWindow(windowId, access);
+    const before = composeWindowSnapshot(win, access);
+    if (typeof expectedRevision !== "string" || before.revision !== expectedRevision) {
+      return { success: false, error: "Compose revision changed; read the editor again" };
+    }
+    if (composeOwnedPrompts(win).length) return { success: false, error: "Resolve the editor dialog before saving" };
+    if (typeof win.SaveAsDraft !== "function") return { success: false, error: "Draft saving is unavailable" };
+    composeWindowOperations.add(win);
+    compose = win.gMsgCompose;
+    const saved = await new Promise(resolve => {
+      let processDone = false;
+      let folderURI = "";
+      let settled = false;
+      const finish = result => { if (!settled) { settled = true; resolve(result); } };
+      const confirm = () => {
+        if (settled || !processDone || !folderURI) return;
+        if (win.gSaveOperationInProgress || win.gWindowLocked || win.gAutoSavingInProgress) {
+          if (unlockTimer === undefined) unlockTimer = win.setTimeout(() => { unlockTimer = undefined; confirm(); }, 50);
+          return;
+        }
+        finish({ saved: true });
+      };
+      listener = {
+        QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+        NotifyComposeFieldsReady() {}, NotifyComposeBodyReady() {},
+        ComposeProcessDone(status) {
+          if (!Components.isSuccessCode(status)) finish({ saved: false });
+          else { processDone = true; confirm(); }
+        },
+        SaveInFolderDone(uri) { folderURI = String(uri || ""); confirm(); },
+      };
+      compose.RegisterStateListener(listener);
+      timeout = win.setTimeout(() => finish({ saved: false }), 25000);
+      // This is the ONLY native delivery command permitted here. No send mode,
+      // discard path or delayed close flag can be supplied by the caller.
+      Promise.resolve(win.SaveAsDraft()).catch(() => finish({ saved: false }));
+    });
+    compose.UnregisterStateListener(listener);
+    listener = null;
+    win.clearTimeout(timeout);
+    if (!saved.saved || !win.GetComposeDetails().draftId) {
+      return { success: false, saved: false, closed: false, error: "Draft save was not confirmed; editor remains open" };
+    }
+    const after = composeWindowSnapshot(selectedComposeWindow(windowId, access, true), access);
+    if (closeAfterSave) {
+      if (after.revision !== before.revision || after.modified) {
+        win.gContentChanged = true;
+        win.gMsgCompose.bodyModified = true;
+        return { success: false, saved: true, closed: false, error: "Editor changed during save; read it again before closing" };
+      }
+      win.close();
+      if (!win.closed) return { success: false, saved: true, closed: false, error: "Draft saved, but Thunderbird did not close the editor" };
+      thunderbirdWindowsById.delete(windowId);
+    }
+    return { success: true, windowId, saved: true, closed: !!win.closed, draftId: after.draftId };
+  } catch {
+    return { success: false, saved: false, closed: !!win?.closed, error: "Could not confirm saving the selected editor; do not close it" };
+  } finally {
+    if (listener) { try { compose.UnregisterStateListener(listener); } catch {} }
+    if (timeout !== undefined) win.clearTimeout(timeout);
+    if (unlockTimer !== undefined) win.clearTimeout(unlockTimer);
+    if (win) composeWindowOperations.delete(win);
+  }
+}
+
 function getComposeSendStatus(windowId, access) {
   const attempt = composeSendAttempts.get(windowId);
   if (!attempt || !access.canAccess(attempt.identity)) return { success: false, error: "No accessible send attempt for this window" };
@@ -2791,6 +2939,37 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           confirmChange: {type: "boolean", const: true},
           confirmCreate: {type: "boolean", const: true}, confirmSend: {type: "boolean", const: true},
         }, required: ["action"]},
+      },
+      {
+        name: "saveComposeWindow", group: "messages", crud: "update",
+        title: "Save Existing Compose Editor and Optionally Close",
+        description: "Save the selected existing editor as a draft and wait for native save confirmation. closeAfterSave optionally closes only that editor after confirmed saving and an unchanged revision. Failures leave it open. Never sends, discards or creates a new compose window.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            windowId: { type: "string", minLength: 1, maxLength: 64 },
+            expectedRevision: { type: "string", minLength: 64, maxLength: 64 },
+            closeAfterSave: { type: "boolean", description: "Close only after confirmed saving (default false)" },
+          }, required: ["windowId", "expectedRevision"], additionalProperties: false,
+        },
+      },
+      {
+        name: "getMailAccountConfiguration", group: "system", crud: "read",
+        title: "Inspect Sending Account and SMTP Route",
+        description: "Read one accessible account's effective direct-send grant and per-identity explicit SMTP binding, including host, port and security mode. Does not connect or test delivery.",
+        inputSchema: { type: "object", properties: { accountId: { type: "string", pattern: "^account[1-9][0-9]*$" } }, required: ["accountId"], additionalProperties: false },
+      },
+      {
+        name: "setFullMailAccess", group: "system", crud: "update",
+        title: "Change Full Mail Access",
+        description: "Enable or disable access to all current and future accounts and address books, including direct-send capability. Requires explicit user authorization and confirmChange. Preserves granular selections and send quotas.",
+        inputSchema: { type: "object", properties: { enabled: { type: "boolean" }, confirmChange: { type: "boolean", enum: [true] } }, required: ["enabled", "confirmChange"], additionalProperties: false },
+      },
+      {
+        name: "refreshMailAccount", group: "system", crud: "update",
+        title: "Refresh Selected IMAP Inbox",
+        description: "Start or check native refresh of one accessible TLS IMAP inbox. Start requires confirmRefresh. Only completion of the native message fetch verifies refresh. Does not send mail.",
+        inputSchema: { type: "object", properties: { accountId: { type: "string", pattern: "^account[1-9][0-9]*$" }, action: { type: "string", enum: ["start", "status"] }, confirmRefresh: { type: "boolean", enum: [true] } }, required: ["accountId", "action"], additionalProperties: false },
       },
       {
         name: "getComposeWindow", group: "messages", crud: "read",
@@ -3726,7 +3905,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "getAccountAccess",
         group: "system", crud: "read",
         title: "Get Account Access",
-        description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
+        description: "Get the current account access control list. Shows which accounts the MCP server can access. Configure granular access in Thunderbird options. Use setFullMailAccess for the explicit full-access opt-in.",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
       ];
@@ -4050,6 +4229,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function getAllowedAccountIds() {
               try {
+                const all = fullMailAccessIds("accounts");
+                if (all !== null) return all;
                 const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
                 if (!pref) return [];
                 const parsed = JSON.parse(pref);
@@ -4074,6 +4255,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function getAllowedAddressBookIds() {
               try {
+                const all = fullMailAccessIds("addressBooks");
+                if (all !== null) return all;
                 const pref = Services.prefs.getStringPref(PREF_ALLOWED_ADDRESS_BOOKS, "");
                 if (!pref) return [];
                 const parsed = JSON.parse(pref);
@@ -4254,9 +4437,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 readOnly: !!book.readOnly,
               }));
               return {
-                mode: allowed.length === 0 ? "none" : "restricted",
+                mode: fullMailAccessEnabled() ? "all" : (allowed.length === 0 ? "none" : "restricted"),
                 accounts: accessibleAccounts,
-                addressBookMode: allowedAddressBooks.length === 0 ? "none" : "restricted",
+                addressBookMode: fullMailAccessEnabled() ? "all" : (allowedAddressBooks.length === 0 ? "none" : "restricted"),
                 addressBooks: accessibleAddressBooks,
               };
             }
@@ -8282,6 +8465,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             let mailMergeController;
+            let refreshSelectedInbox;
 
             const DIRECT_SEND_AUTHORIZATION = Symbol("thunderbird-mcp-safe.direct-send");
 
@@ -11464,7 +11648,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const config = readDirectSendConfigFromPrefs();
                         const quota = getDirectSendQuotaState();
                         if (config.error || quota.error) return {error: config.error || quota.error};
-                        if (!hasExplicitMailMergeSmtp(source.win.gCurrentIdentity, source.accountId, MailServices)) {
+                        if (!inspectMailMergeSmtp(source.win.gCurrentIdentity, source.accountId, MailServices).supported) {
                           return { error: "Mail Merge sending requires an explicitly assigned SMTP server" };
                         }
                         let reservationCredit = 0, continuationContext;
@@ -11505,6 +11689,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                   return await mailMergeController(args);
                 }
+                case "getMailAccountConfiguration":
+                  return inspectMailingAccount(args.accountId, MailServices, isAccountAllowed, readDirectSendConfigFromPrefs());
+                case "setFullMailAccess":
+                  return setFullMailAccess(args);
+                case "refreshMailAccount": {
+                  if (!refreshSelectedInbox) {
+                    const uri = "resource://" + resourceName + "/mcp_server/mail_refresh.sys.mjs?version=" + context.extension.version;
+                    const module = ChromeUtils.importESModule(uri);
+                    refreshSelectedInbox = module.createMailAccountRefresher({ MailServices, Services, Ci, Components, ChromeUtils }, isAccountAllowed);
+                  }
+                  return refreshSelectedInbox(args);
+                }
+                case "saveComposeWindow":
+                  return await saveComposeWindow(args.windowId, args.expectedRevision, args.closeAfterSave ?? false,
+                    { canAccess: identity => isAccountAllowed(findIdentityAccountKey(identity)), hash: safeFilterSha256 });
                 case "getComposeWindow":
                   return getComposeWindow(args.windowId, { canAccess: identity => isAccountAllowed(findIdentityAccountKey(identity)), hash: safeFilterSha256 }, args.focus ?? false);
                 case "getComposeSendStatus":
@@ -11584,6 +11783,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, normalizeSafeInlineAttachments(args.attachments), false);
                 case "sendMailDirect":
+                  if (fullMailAccessEnabled()) {
+                    if (args.confirmSend !== true) return { error: "Full access direct send requires explicit confirmSend: true" };
+                    const identity = findIdentity(args.from);
+                    if (!inspectMailMergeSmtp(identity, findIdentityAccountKey(identity), MailServices).supported) {
+                      return { error: "Full access direct send requires explicitly assigned SMTP" };
+                    }
+                  }
                   return await sendMailDirect(args);
                 case "saveDraft":
                   return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, normalizeSafeInlineAttachments(args.attachments));
@@ -12029,6 +12235,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             console.warn("thunderbird-mcp: account-access pref is not valid JSON:", e.message);
           }
 
+          const fullIds = fullMailAccessIds("accounts");
+          if (fullIds !== null) { allowed = fullIds; corrupt = false; }
+
           const accounts = [];
           for (const account of MailServices.accounts.accounts) {
             const server = account.incomingServer;
@@ -12040,7 +12249,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             });
           }
           return {
-            mode: corrupt ? "error" : (allowed.length === 0 ? "none" : "restricted"),
+            mode: fullIds !== null ? "all" : corrupt ? "error" : (allowed.length === 0 ? "none" : "restricted"),
             allowedAccountIds: allowed,
             accounts,
             ...(corrupt ? { error: "Account access preference is corrupt. All accounts are blocked." } : {}),
@@ -12048,6 +12257,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         setAccountAccess: async function(allowedAccountIds) {
+          if (fullMailAccessEnabled()) return { error: "Disable full access before changing granular access." };
           if (!Array.isArray(allowedAccountIds)) {
             return { error: "allowedAccountIds must be an array" };
           }
@@ -12096,6 +12306,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             console.warn("thunderbird-mcp: address-book access pref is not valid JSON:", e.message);
           }
 
+          const fullIds = fullMailAccessIds("addressBooks");
+          if (fullIds !== null) { allowed = fullIds; corrupt = false; }
+
           const addressBooks = Array.from(MailServices.ab.directories).map(book => ({
             id: book.UID,
             name: book.dirName,
@@ -12103,7 +12316,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             allowed: !corrupt && allowed.includes(book.UID),
           }));
           return {
-            mode: corrupt ? "error" : (allowed.length === 0 ? "none" : "restricted"),
+            mode: fullIds !== null ? "all" : corrupt ? "error" : (allowed.length === 0 ? "none" : "restricted"),
             allowedAddressBookIds: allowed,
             addressBooks,
             ...(corrupt ? { error: "Address-book access preference is corrupt. All address books are blocked." } : {}),
@@ -12111,6 +12324,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         setAddressBookAccess: async function(allowedAddressBookIds) {
+          if (fullMailAccessEnabled()) return { error: "Disable full access before changing granular access." };
           if (!Array.isArray(allowedAddressBookIds)) {
             return { error: "allowedAddressBookIds must be an array" };
           }
@@ -12145,7 +12359,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             "resource:///modules/MailServices.sys.mjs"
           );
           const config = readDirectSendConfigFromPrefs();
-          let accessibleIds;
+          let accessibleIds = [];
           try {
             const raw = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
             const parsed = raw ? JSON.parse(raw) : [];
@@ -12155,6 +12369,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           } catch {
             accessibleIds = [];
           }
+          accessibleIds = fullMailAccessIds("accounts") ?? accessibleIds;
           const accounts = [];
           for (const account of MailServices.accounts.accounts) {
             if (!accessibleIds.includes(account.key)) continue;
@@ -12184,6 +12399,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           const auditFile = auditDirectory.clone();
           auditFile.append("direct-send-audit.jsonl");
           return {
+            mode: fullMailAccessEnabled() ? "all" : "restricted",
             enabled: config.enabled === true && !config.error,
             allowedAccountIds: config.allowedAccountIds,
             allowedRecipients: config.allowedRecipients,
@@ -12207,6 +12423,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           dailyLimit,
           confirmationPhrase
         ) {
+          if (fullMailAccessEnabled()) return { error: "Disable full access before changing granular direct-send settings." };
           const { MailServices } = ChromeUtils.importESModule(
             "resource:///modules/MailServices.sys.mjs"
           );
