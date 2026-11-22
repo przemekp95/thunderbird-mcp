@@ -108,6 +108,15 @@ Po odpowiedzi trzeba osobno sprawdzić wynik wysyłki w folderze „Wysłane”.
 
 #### Mail Merge przez MCP
 
+Przed wysyłką użyj `getMailAccountConfiguration`, aby sprawdzić uprawnienie
+do wysyłki i jawnie przypisany serwer SMTP wybranej tożsamości. Odczyt
+pokazuje host, port i tryb zabezpieczenia. Dostarczenie próby zweryfikuj
+w logach dostawcy i w skrzynce odbiorczej. `refreshMailAccount` z
+`action: "start"` i `confirmRefresh: true` odświeża wskazaną skrzynkę
+IMAP z TLS. Sprawdź `refreshVerified` w wyniku akcji `status`.
+`saveComposeWindow` zapisuje wskazany otwarty szkic po sprawdzeniu jego
+rewizji. Domyślnie zostawia okno otwarte.
+
 `controlMailMerge` obsługuje aktywny dodatek Mail Merge **11.6.1**.
 Otwórz edytor przez `sendMail` i odczytaj jego rewizję przez `getComposeWindow`.
 Wywołaj `prepare` z identyfikatorem okna, rewizją i CSV (UTF-8, separator
@@ -181,7 +190,14 @@ folder jako istniejący online.
 - używać stałego tokenu;
 - aktualizować dodatku automatycznie.
 
-Brak wybranego konta oznacza brak dostępu do wszystkich kont. Kontakty mają
+W trybie granularnym brak wybranego konta oznacza brak dostępu.
+Po wyraźnym upoważnieniu `setFullMailAccess` z `enabled: true` i
+`confirmChange: true` obejmuje wszystkie obecne i przyszłe konta i książki
+adresowe, wraz z uprawnieniem do wysyłki. Tryb jest domyślnie wyłączony
+w nowych profilach. Wyłączenie przywraca zapisane ustawienia granularne.
+W tym trybie zarówno Mail Merge, jak i `sendMailDirect` wymagają
+odrębnego potwierdzenia wysyłki i jawnie przypisanego serwera SMTP.
+Kontakty w trybie granularnym mają
 osobną białą listę: brak wybranej książki adresowej blokuje wszystkie kontakty.
 Dla list kont i książek adresowych nie istnieje tryb „pusta lista = wszystko”.
 

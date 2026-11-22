@@ -43,6 +43,7 @@ const EXPECTED_SAFE_TOOLS = [
   "displayMessage",
   "listThunderbirdWindows",
   "getComposeWindow",
+  "saveComposeWindow",
   "sendComposeWindow",
   "controlMailMerge",
   "getComposeSendStatus",
@@ -70,6 +71,9 @@ const EXPECTED_SAFE_TOOLS = [
   "disableFilter",
   "deleteFilter",
   "getAccountAccess",
+  "getMailAccountConfiguration",
+  "setFullMailAccess",
+  "refreshMailAccount",
 ];
 
 function getMarkedSnippet(source, startMarker, endMarker) {
@@ -105,17 +109,20 @@ this.safePolicy = {
   return sandbox.safePolicy;
 }
 
-function loadAccountPolicy(prefValue) {
+function loadAccountPolicy(prefValue, fullAccess = false) {
   const snippet = getMarkedSnippet(
     apiSource,
     "// BEGIN SAFE ACCOUNT ACCESS POLICY",
     "// END SAFE ACCOUNT ACCESS POLICY"
   );
+  const directSend = getMarkedSnippet(apiSource, "// BEGIN DIRECT SEND POLICY", "// END DIRECT SEND POLICY");
   const sandbox = {
     console: { error() {} },
+    ChromeUtils: { importESModule: () => ({ MailServices: { accounts: { accounts: [{ key: "account1" }, { key: "account2" }] } } }) },
     PREF_ALLOWED_ACCOUNTS: "extensions.thunderbird-mcp-safe.allowedAccounts",
     Services: {
       prefs: {
+        getBoolPref: () => fullAccess,
         getStringPref() {
           return prefValue;
         },
@@ -124,7 +131,8 @@ function loadAccountPolicy(prefValue) {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${snippet}
+    `${directSend}
+${snippet}
 this.accountPolicy = { getAllowedAccountIds, isAccountAllowed };`,
     sandbox
   );
@@ -536,6 +544,13 @@ describe("account policy is default-deny", () => {
     const policy = loadAccountPolicy('["account2"]');
     assert.equal(policy.isAccountAllowed("account1"), false);
     assert.equal(policy.isAccountAllowed("account2"), true);
+  });
+
+  it("uses the current accounts when full access is explicitly enabled", () => {
+    const policy = loadAccountPolicy('["account2"]', true);
+    assert.deepEqual(Array.from(policy.getAllowedAccountIds()), ["account1", "account2"]);
+    assert.equal(policy.isAccountAllowed("account1"), true);
+    assert.equal(policy.isAccountAllowed("missing"), false);
   });
 
   it("fails closed when the preference is corrupt", () => {

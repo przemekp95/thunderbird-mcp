@@ -126,6 +126,8 @@ async function loadAccounts() {
     for (const account of config.accounts || []) {
       appendAccount(account);
     }
+    saveAccounts.disabled = config.mode === "all";
+    for (const input of accountList.querySelectorAll("input")) input.disabled = config.mode === "all";
     if (!config.accounts || config.accounts.length === 0) {
       const empty = document.createElement("p");
       empty.textContent = "No Thunderbird mail accounts were found.";
@@ -133,6 +135,8 @@ async function loadAccounts() {
     }
     if (config.error) {
       setStatus(config.error, true);
+    } else if (config.mode === "all") {
+      setStatus("Full access: all current and future accounts. Individual selection is disabled.");
     } else if (config.mode === "none") {
       setStatus("All accounts are currently blocked.");
     } else {
@@ -154,6 +158,8 @@ async function loadAddressBooks() {
     for (const addressBook of config.addressBooks || []) {
       appendAddressBook(addressBook);
     }
+    saveAddressBooks.disabled = config.mode === "all";
+    for (const input of addressBookList.querySelectorAll("input")) input.disabled = config.mode === "all";
     if (!config.addressBooks || config.addressBooks.length === 0) {
       const empty = document.createElement("p");
       empty.textContent = "No Thunderbird address books were found.";
@@ -161,6 +167,8 @@ async function loadAddressBooks() {
     }
     if (config.error) {
       setAddressBookStatus(config.error, true);
+    } else if (config.mode === "all") {
+      setAddressBookStatus("Full access: all current and future address books. Individual selection is disabled.");
     } else if (config.mode === "none") {
       setAddressBookStatus("All address books are currently blocked.");
     } else {
@@ -189,6 +197,8 @@ async function loadDirectSend() {
     for (const account of config.accounts || []) {
       appendDirectSendAccount(account);
     }
+    saveDirectSend.disabled = config.mode === "all";
+    for (const input of directSendAccountList.querySelectorAll("input")) input.disabled = config.mode === "all";
     if (!config.accounts || config.accounts.length === 0) {
       const empty = document.createElement("p");
       empty.textContent = "No MCP-accessible mail accounts are available.";
@@ -196,6 +206,8 @@ async function loadDirectSend() {
     }
     if (config.error || config.quotaError) {
       setDirectSendStatus(config.error || config.quotaError, true);
+    } else if (config.mode === "all") {
+      setDirectSendStatus("Full access: all current and future accounts and valid recipients. Each send still requires user authorization. The configured daily ceiling applies.");
     } else if (config.enabled && (config.allowedRecipients || []).length > 0) {
       setDirectSendStatus("Enabled for the checked accounts and listed recipients.");
     } else if (config.enabled) {
