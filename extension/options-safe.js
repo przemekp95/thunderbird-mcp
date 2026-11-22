@@ -181,9 +181,9 @@ async function loadDirectSend() {
     directSendEnabled.checked = config.enabled === true;
     directSendRecipients.value = (config.allowedRecipients || []).join("\n");
     directSendMaxRecipients.value = String(config.maxRecipientsPerMessage || 1);
-    directSendDailyLimit.value = String(config.dailyLimit || 10);
+    directSendDailyLimit.value = String(config.dailyLimit ?? 10);
     directSendQuota.textContent =
-      `${String(config.quotaUsed || 0)} used · ${String(config.quotaRemaining || 0)} remaining · ${String(config.quotaDate || "—")} UTC`;
+      `${String(config.quotaUsed || 0)} used · ${config.dailyLimit === 0 ? "unlimited" : `${config.quotaRemaining ?? 0} remaining`} · ${String(config.quotaDate || "—")} UTC`;
     directSendAuditPath.textContent = String(config.auditPath || "—");
     directSendAccountList.replaceChildren();
     for (const account of config.accounts || []) {
@@ -278,7 +278,7 @@ directSendForm.addEventListener("submit", async event => {
       allowedAccountIds,
       allowedRecipients,
       Number(directSendMaxRecipients.value),
-      Number(directSendDailyLimit.value),
+      directSendDailyLimit.valueAsNumber,
       directSendConfirmation.value
     );
     if (result.error) {

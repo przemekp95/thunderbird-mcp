@@ -1008,7 +1008,7 @@ const DIRECT_SEND_CONFIRMATION_PHRASE = "ENABLE DIRECT SEND";
 const DIRECT_SEND_DEFAULT_MAX_RECIPIENTS = 1;
 const DIRECT_SEND_DEFAULT_DAILY_LIMIT = 10;
 const DIRECT_SEND_MAX_RECIPIENTS_HARD_CAP = 10;
-const DIRECT_SEND_DAILY_LIMIT_HARD_CAP = 100;
+const DIRECT_SEND_DAILY_LIMIT_HARD_CAP = 300;
 const DIRECT_SEND_MAX_SUBJECT_CHARS = 998;
 const DIRECT_SEND_MAX_BODY_CHARS = 200000;
 const DIRECT_SEND_MAX_HEADER_CHARS = 4000;
@@ -1173,11 +1173,11 @@ function validateDirectSendSettings(settings, accessibleAccountIds) {
   }
   if (
     !Number.isInteger(dailyLimit) ||
-    dailyLimit < 1 ||
+    dailyLimit < 0 ||
     dailyLimit > DIRECT_SEND_DAILY_LIMIT_HARD_CAP
   ) {
     return {
-      error: `dailyLimit must be an integer from 1 to ${DIRECT_SEND_DAILY_LIMIT_HARD_CAP}`,
+      error: `dailyLimit must be 0 (unlimited) or an integer from 1 to ${DIRECT_SEND_DAILY_LIMIT_HARD_CAP}`,
     };
   }
   if (enabled && accountResult.values.length === 0) {
@@ -1221,7 +1221,7 @@ function evaluateDirectSendRequest(config, request, usedToday) {
   if (!Number.isInteger(usedToday) || usedToday < 0) {
     return { error: "Direct-send quota state is corrupt; sending is blocked" };
   }
-  if (usedToday >= config.dailyLimit) {
+  if (config.dailyLimit !== 0 && usedToday >= config.dailyLimit) {
     return { error: `Direct-send daily limit of ${config.dailyLimit} has been reached` };
   }
   return { ok: true, recipients: parsed.recipients };
@@ -1264,6 +1264,30 @@ function readDirectSendConfigFromPrefs() {
     console.warn("thunderbird-mcp: direct-send preferences are corrupt; disabling direct send:", error);
     return { ...defaults, error: "Direct-send preferences are corrupt; direct send is disabled" };
   }
+}
+// Deliberately exposes only the daily ceiling: never clears quota or changes grants.
+function controlDirectSendLimit(args, now = new Date()) {
+  const fail = () => ({ success: false, error: "Daily limit request is invalid, stale or could not be persisted" });
+  if (!args || typeof args !== "object" || Array.isArray(args) ||
+      !Object.keys(args).every(k => ["action", "dailyLimit", "expectedDailyLimit", "confirmChange"].includes(k))) return fail();
+  const prefs = Services.prefs;
+  try {
+    const before = prefs.getIntPref(PREF_DIRECT_SEND_DAILY_LIMIT, DIRECT_SEND_DEFAULT_DAILY_LIMIT);
+    const date = now.toISOString().slice(0, 10);
+    const used = prefs.getStringPref(PREF_DIRECT_SEND_QUOTA_DATE, "") === date ? prefs.getIntPref(PREF_DIRECT_SEND_QUOTA_COUNT, 0) : 0;
+    if (!Number.isInteger(before) || before < 0 || before > DIRECT_SEND_DAILY_LIMIT_HARD_CAP || !Number.isInteger(used) || used < 0) return fail();
+    if (args.action === "status") {
+      if (Object.keys(args).length !== 1) return fail();
+    } else if (args.action === "set") {
+      if (args.confirmChange !== true || args.expectedDailyLimit !== before ||
+          !Number.isInteger(args.dailyLimit) || args.dailyLimit < 0 || args.dailyLimit > DIRECT_SEND_DAILY_LIMIT_HARD_CAP) return fail();
+      try { prefs.setIntPref(PREF_DIRECT_SEND_DAILY_LIMIT, args.dailyLimit); prefs.savePrefFile(null); }
+      catch { prefs.setIntPref(PREF_DIRECT_SEND_DAILY_LIMIT, before); return fail(); }
+    } else return fail();
+    const dailyLimit = args.action === "set" ? args.dailyLimit : before;
+    return { success: true, dailyLimit, maximumDailyLimit: DIRECT_SEND_DAILY_LIMIT_HARD_CAP, quotaDate: date, quotaUsed: used,
+      quotaRemaining: dailyLimit === 0 ? null : Math.max(0, dailyLimit - used), scope: "global MCP attempts including reserved batches; provider quota is separate", sendsMail: false };
+  } catch { return fail(); }
 }
 // END DIRECT SEND POLICY
 // BEGIN SAFE FILTER POLICY
@@ -1743,7 +1767,9 @@ const SAFE_TOOL_NAMES = new Set([
   "listThunderbirdWindows",
   "getComposeWindow",
   "sendComposeWindow",
+  "controlMailMerge",
   "getComposeSendStatus",
+  "controlDirectSendLimit",
   "closeThunderbirdWindow",
   "respondToSmtpPrompt",
   "sendMail",
@@ -2501,6 +2527,21 @@ function respondToSmtpPrompt(windowId, password, rememberPassword = false) {
 }
 // END THUNDERBIRD WINDOW CONTROLS
 
+// Mail Merge uses the native compose transport. Require an explicit live SMTP
+// binding for supported account types before letting it submit a batch.
+function hasExplicitMailMergeSmtp(identity, accountId, mailServices) {
+  if (!identity?.key || !accountId || !identity.smtpServerKey) return false;
+  const owners = Array.from(mailServices.accounts.accounts).filter(account =>
+    Array.from(account.identities).some(candidate => candidate.key === identity.key)
+  );
+  if (owners.length !== 1 || owners[0].key !== accountId ||
+      !["imap", "pop3", "none"].includes(owners[0].incomingServer?.type)) return false;
+  const servers = Array.from(mailServices.outgoingServer?.servers ?? []).filter(
+    server => server.key === identity.smtpServerKey
+  );
+  return servers.length === 1 && servers[0].type === "smtp" && !!servers[0].hostname?.trim();
+}
+
 // BEGIN COMPOSE WINDOW CONTROLS
 // Operate on an explicitly observed editor, never a most-recent window. Access
 // and hashing are supplied by the server's existing account policy helpers.
@@ -2711,6 +2752,46 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         birthday: { type: "string", description: "Birthday as YYYY-MM-DD or --MM-DD when the year is unknown" },
       };
       return [
+      {
+        name: "controlDirectSendLimit", group: "system", crud: "update",
+        title: "Control MCP Daily Attempt Limit",
+        description: "Read or explicitly change the daily MCP attempt limit. Use 0 for unlimited or 1–300 for a finite limit. Changing the ceiling requires confirmChange and the freshly read expectedDailyLimit. The current attempt count and account and recipient permissions are preserved. Provider limits are independent.",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            action: { type: "string", enum: ["status", "set"] },
+            dailyLimit: { type: "integer", minimum: 0, maximum: DIRECT_SEND_DAILY_LIMIT_HARD_CAP },
+            expectedDailyLimit: { type: "integer", minimum: 0, maximum: DIRECT_SEND_DAILY_LIMIT_HARD_CAP },
+            confirmChange: { type: "boolean", const: true },
+          },
+          required: ["action"],
+        },
+      },
+      {
+        name: "controlMailMerge", group: "messages", crud: "create",
+        title: "Control Native Mail Merge",
+        description: "Control pinned Mail Merge 11.6.1 for one observed accessible compose window. " +
+          "Use status without a window to check addon availability. Prepare requires a fresh compose revision and bounded inline CSV. " +
+          "Preview, drafts and send use the returned batch revision. Drafts require confirmCreate. " +
+          "Send requires explicit confirmSend, an assigned SMTP server, account and recipient policy, quota reservation and audit. " +
+          "Poll status for progress and verify delivery independently. Close only a non-running managed dialog. " +
+          "Background with confirmChange disables native send progress windows globally. " +
+          "To resume a failed same-day batch, use resumeAuditId with the exact remaining recipient order after checking provider logs. " +
+          "Set resumeSkipAcceptedFirst only if the provider confirmed acceptance of the first uncertain message.",
+        inputSchema: {type: "object", additionalProperties: false, properties: {
+          action: {type: "string", enum: ["status", "background", "prepare", "preview", "drafts", "send", "close"]},
+          windowId: {type: "string", minLength: 1, maxLength: 100},
+          expectedRevision: {type: "string", minLength: 1, maxLength: 100},
+          csv: {type: "string", minLength: 1, maxLength: 262144},
+          start: {type: "integer", minimum: 1, maximum: 500}, stop: {type: "integer", minimum: 1, maximum: 500},
+          pauseSeconds: {type: "integer", minimum: 0, maximum: 60},
+          resumeAuditId: {type: "string", pattern: "^[a-f0-9]{24}$"},
+          resumeSkipAcceptedFirst: {type: "boolean", const: true},
+          confirmChange: {type: "boolean", const: true},
+          confirmCreate: {type: "boolean", const: true}, confirmSend: {type: "boolean", const: true},
+        }, required: ["action"]},
+      },
       {
         name: "getComposeWindow", group: "messages", crud: "read",
         title: "Read Existing Compose Editor",
@@ -8200,6 +8281,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
             }
 
+            let mailMergeController;
+
             const DIRECT_SEND_AUTHORIZATION = Symbol("thunderbird-mcp-safe.direct-send");
 
             function findIdentityAccountKey(identity) {
@@ -8266,7 +8349,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function reserveDirectSendQuota(config, now = new Date()) {
               const current = getDirectSendQuotaState(now);
               if (current.error) return current;
-              if (current.used >= config.dailyLimit) {
+              if (config.dailyLimit !== 0 && current.used >= config.dailyLimit) {
                 return { error: `Direct-send daily limit of ${config.dailyLimit} has been reached` };
               }
               const used = current.used + 1;
@@ -8275,7 +8358,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return {
                 date: current.date,
                 used,
-                remaining: config.dailyLimit - used,
+                remaining: config.dailyLimit === 0 ? null : config.dailyLimit - used,
               };
             }
             // END DIRECT SEND QUOTA
@@ -11358,6 +11441,70 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 throw new Error(`Tool is not available in the reviewed safe build: ${name}`);
               }
               switch (name) {
+                case "controlDirectSendLimit":
+                  return controlDirectSendLimit(args);
+                case "controlMailMerge": {
+                  if (!mailMergeController) {
+                    const module = ChromeUtils.importESModule(`resource://${resourceName}/mcp_server/mail_merge.sys.mjs?version=${context.extension.version}`);
+                    const services = module.createNativeMailMergeServices({ChromeUtils, Services,
+                      actorModuleUri: `resource://${resourceName}/mcp_server/mail_merge_actor.sys.mjs?version=${context.extension.version}`,
+                      hash: safeFilterSha256,
+                      select(windowId) {
+                        const access = {canAccess: identity => isAccountAllowed(findIdentityAccountKey(identity)), hash: safeFilterSha256};
+                        const win = selectedComposeWindow(windowId, access, false, true);
+                        if (win.gSaveOperationInProgress || win.gAutoSavingInProgress || composeOwnedPrompts(win).length) throw new Error("Editor busy");
+                        return {win, revision: composeWindowSnapshot(win, access).revision, identityId: win.gCurrentIdentity.key, email: win.gCurrentIdentity.email, accountId: findIdentityAccountKey(win.gCurrentIdentity)};
+                      },
+                      validateRecipients(row, source) {
+                        if (parseDirectSendRecipients(row.to, row.cc, row.bcc).error) throw new Error("Invalid expanded recipients");
+                        const sender = parseDirectSendRecipients(row.from, "", "");
+                        if (sender.error || sender.recipients.length !== 1 || sender.recipients[0].toLowerCase() !== source.email.toLowerCase()) throw new Error("Expanded sender changed identity");
+                      },
+                      async authorizeBatch(rows, source, windowId, resumeAuditId, resumeSkipAcceptedFirst) {
+                        const config = readDirectSendConfigFromPrefs();
+                        const quota = getDirectSendQuotaState();
+                        if (config.error || quota.error) return {error: config.error || quota.error};
+                        if (!hasExplicitMailMergeSmtp(source.win.gCurrentIdentity, source.accountId, MailServices)) {
+                          return { error: "Mail Merge sending requires an explicitly assigned SMTP server" };
+                        }
+                        let reservationCredit = 0, continuationContext;
+                        if (resumeAuditId !== undefined) {
+                          const auditFile = getSafeProfileTempDirectory("audit").clone();
+                          auditFile.append("direct-send-audit.jsonl");
+                          if (!auditFile.exists() || auditFile.isSymlink() || !auditFile.isFile() || auditFile.fileSize > DIRECT_SEND_AUDIT_MAX_BYTES) throw new Error("Unsafe reservation ledger");
+                          const input = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+                          input.init(auditFile, 0x01, 0o400, 0);
+                          const reader = Cc["@mozilla.org/intl/converter-input-stream;1"].createInstance(Ci.nsIConverterInputStream);
+                          let ledger = "";
+                          try {
+                            reader.init(input, "UTF-8", 4096, 0);
+                            const chunk = {};
+                            while (reader.readString(4096, chunk)) ledger += chunk.value;
+                          } finally { reader.close(); input.close(); }
+                          const records = ledger.trim().split("\n").map(line => JSON.parse(line));
+                          const recipients = rows.map(row => {
+                            const parsed = parseDirectSendRecipients(row.to, row.cc, row.bcc);
+                            if (parsed.error || parsed.recipients.length !== 1) throw new Error("Continuation requires one recipient per message");
+                            return parsed.recipients[0];
+                          });
+                          continuationContext = {records, args: {auditId: resumeAuditId, accountId: source.accountId, recipients, date: quota.date, used: quota.used, skipAcceptedFirst:resumeSkipAcceptedFirst}};
+                          reservationCredit = module.validateMailMergeContinuation(records, continuationContext.args).reservedCredit;
+                        }
+                        const policies = rows.map((row, index) => evaluateDirectSendRequest(config, {accountId: source.accountId, to: row.to, cc: row.cc, bcc: row.bcc}, quota.used + index - reservationCredit));
+                        const denied = policies.find(policy => policy.error);
+                        if (denied) return denied;
+                        if (continuationContext) module.claimMailMergeContinuation(continuationContext.records, continuationContext.args);
+                        const auditId = generateAuthToken().slice(0, 24);
+                        appendDirectSendAudit({timestamp: new Date().toISOString(), auditId, phase: "authorized", operation: "mailMerge", windowId, accountId: source.accountId, messages: rows.length, recipients: policies.flatMap(policy => policy.recipients), ...(resumeAuditId ? {resumeOf: resumeAuditId, reservationCredit, ...(resumeSkipAcceptedFirst?{resumeSkippedUncertain:true}:{})} : {})});
+                        for (let index = 0; index < rows.length - reservationCredit; index++) { const reserved = reserveDirectSendQuota(config); if (reserved.error) return reserved; }
+                        return {auditId};
+                      },
+                      audit: entry => appendDirectSendAudit({timestamp: new Date().toISOString(), ...entry}),
+                    });
+                    mailMergeController = module.createMailMergeController(services);
+                  }
+                  return await mailMergeController(args);
+                }
                 case "getComposeWindow":
                   return getComposeWindow(args.windowId, { canAccess: identity => isAccountAllowed(findIdentityAccountKey(identity)), hash: safeFilterSha256 }, args.focus ?? false);
                 case "getComposeSendStatus":
@@ -12044,7 +12191,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             dailyLimit: config.dailyLimit,
             quotaDate: today,
             quotaUsed,
-            quotaRemaining: Math.max(0, config.dailyLimit - quotaUsed),
+            quotaRemaining: config.dailyLimit === 0 ? null : Math.max(0, config.dailyLimit - quotaUsed),
             auditPath: auditFile.path,
             accounts,
             ...(config.error ? { error: config.error } : {}),

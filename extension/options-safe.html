@@ -102,8 +102,8 @@
             <input type="number" id="directSendMaxRecipients" min="1" max="10" value="1">
           </label>
           <label class="field">
-            <span>Maximum accepted attempts per UTC day</span>
-            <input type="number" id="directSendDailyLimit" min="1" max="100" value="10">
+            <span>Maximum accepted attempts per UTC day (0 for unlimited)</span>
+            <input type="number" id="directSendDailyLimit" min="0" max="300" value="10" required>
           </label>
         </div>
 

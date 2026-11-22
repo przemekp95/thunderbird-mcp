@@ -74,7 +74,10 @@ base64; ścieżki do plików komputera są odrzucane w schemacie i dispatcherze.
 `sendMailDirect` jest osobnym narzędziem i pozostaje ukryte, dopóki użytkownik
 nie włączy go w opcjach dodatku. Włączenie wymaga frazy `ENABLE DIRECT SEND`,
 co najmniej jednego jawnie wybranego konta nadawczego, limitu odbiorców na
-wiadomość oraz dziennego limitu zaakceptowanych prób. Lista reguł odbiorców
+wiadomość oraz ustawienia dziennego limitu zaakceptowanych prób. W opcjach
+dodatku wartość `0` wyłącza dzienny limit MCP. Dodatek nadal liczy próby
+w danej dobie UTC i stosuje ten licznik po przywróceniu limitu. Limity
+dostawcy poczty obowiązują niezależnie. Lista reguł odbiorców
 jest opcjonalna: pusta dopuszcza dowolny poprawny składniowo adres, a niepusta
 ogranicza wysyłkę do dokładnych adresów lub domen w formie `*@example.com`.
 Każda zaakceptowana próba i
@@ -102,6 +105,31 @@ okna poczty, edytorów ani dialogów i nie wysyła ani nie usuwa wiadomości.
 serwera poczty wychodzącej. Opcjonalne `rememberPassword` zaznacza pole
 menedżera haseł w tym oknie. Nie obsługuje dowolnych okien ani przycisków.
 Po odpowiedzi trzeba osobno sprawdzić wynik wysyłki w folderze „Wysłane”.
+
+#### Mail Merge przez MCP
+
+`controlMailMerge` obsługuje aktywny dodatek Mail Merge **11.6.1**.
+Otwórz edytor przez `sendMail` i odczytaj jego rewizję przez `getComposeWindow`.
+Wywołaj `prepare` z identyfikatorem okna, rewizją i CSV (UTF-8, separator
+przecinek, do 262 144 znaków). Partia może mieć do 500 wiadomości.
+Opcjonalne `start` i `stop` są indeksami od 1, a `pauseSeconds` ustawia
+przerwę od 0 do 60 sekund pomiędzy natywnymi operacjami.
+
+Użyj zwróconej rewizji partii do `preview`, `drafts` lub `send`.
+`drafts` wymaga `confirmCreate: true`. `send` wymaga osobnej zgody
+użytkownika i `confirmSend: true`. Wysyłanie wymaga jawnie przypisanego
+serwera SMTP dla tożsamości, a każda wiadomość podlega zasadom konta,
+odbiorców i audytowi. Dodatek sprawdza i rezerwuje próby dla całej partii
+przed startem. `status` odczytuje postęp, a `close` zamyka dialog po pracy.
+Stan `completed` potwierdza zakończenie natywnych operacji. Doręczenie
+sprawdź w logach dostawcy. Przed wznowieniem niepewnej próby uzgodnij stan
+z dostawcą i sprawdź dokładną kolejność pozostałych odbiorców.
+
+`controlDirectSendLimit` z `action: "status"` odczytuje limit i liczbę
+prób w bieżącej dobie UTC. `action: "set"` wymaga zgody użytkownika,
+`confirmChange: true` i aktualnego `expectedDailyLimit`. Ustaw
+`dailyLimit: 0`, aby wyłączyć limit, albo od 1 do 300, aby go przywrócić.
+Licznik oraz limity dostawcy poczty obowiązują dalej.
 
 Filtry mają odrębny, ograniczony model bezpieczeństwa. `listFilters` pokazuje
 reguły na dozwolonych kontach, ale pozostałe cztery narzędzia mogą zmieniać

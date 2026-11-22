@@ -92,7 +92,9 @@
           },
           {
             "name": "dailyLimit",
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum attempts per UTC day. Zero disables the ceiling."
           },
           {
             "name": "confirmationPhrase",
