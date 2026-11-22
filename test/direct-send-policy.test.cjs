@@ -395,6 +395,40 @@ describe("direct-send policy", () => {
     );
   });
 
+  it("accepts an explicit unlimited policy while retaining sender and recipient checks", () => {
+    const { policy } = loadPolicy();
+    const config = {
+      enabled: true,
+      allowedAccountIds: ["account1"],
+      allowedRecipients: ["person@example.com"],
+      maxRecipientsPerMessage: 1,
+      dailyLimit: 0,
+    };
+    assert.equal(policy.validateDirectSendSettings(config, ["account1"]).dailyLimit, 0);
+    for (const dailyLimit of [-1, "", 0.5]) {
+      assert.match(policy.validateDirectSendSettings({ ...config, dailyLimit }, ["account1"]).error, /dailyLimit/);
+    }
+    const request = { accountId: "account1", to: "person@example.com" };
+    assert.equal(policy.evaluateDirectSendRequest(config, request, 300).ok, true);
+    assert.match(policy.evaluateDirectSendRequest(config, { ...request, accountId: "other" }, 300).error, /sender account/i);
+    assert.match(policy.evaluateDirectSendRequest(config, { ...request, to: "other@example.com" }, 300).error, /not allowed/i);
+    assert.match(policy.evaluateDirectSendRequest(config, request, -1).error, /corrupt/i);
+  });
+
+  it("records attempts with no ceiling and enforces the accumulated count when a limit is restored", () => {
+    const date = "2026-07-28";
+    const now = new Date(`${date}T12:00:00Z`);
+    const { quota, prefs } = loadQuota({
+      "extensions.thunderbird-mcp-safe.directSendQuotaDate": date,
+      "extensions.thunderbird-mcp-safe.directSendQuotaCount": 300,
+    });
+    const result = quota.reserveDirectSendQuota({ dailyLimit: 0 }, now);
+    assert.equal(result.used, 301);
+    assert.equal(result.remaining, null);
+    assert.equal(prefs.values.get("extensions.thunderbird-mcp-safe.directSendQuotaCount"), 301);
+    assert.match(quota.reserveDirectSendQuota({ dailyLimit: 20 }, now).error, /daily limit/i);
+  });
+
   it("blocks when same-day quota state is corrupt", () => {
     const quotaDate = "2026-07-28";
     const { quota } = loadQuota({

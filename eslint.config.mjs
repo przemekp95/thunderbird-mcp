@@ -74,6 +74,7 @@ export default [
         // ── WebExtension globals ──
         browser: "readonly",
         messenger: "readonly",
+        JSWindowActorChild: "readonly",
         ExtensionAPI: "readonly",
         ExtensionCommon: "readonly",
         // ── Standard browser-ish (background.js + options.js) ──
